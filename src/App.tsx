@@ -1,105 +1,226 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback, useMemo, useRef, lazy, Suspense } from 'react';
 import { 
   Home, Film, Search, User as UserIcon, ShieldCheck, Heart, Sparkles, 
-  ArrowRight, PlayCircle, Star, Calendar, Clock, Compass 
+  ArrowRight, PlayCircle, Star, Calendar, Clock, Compass, Zap, TrendingUp,
+  Award, Monitor, Smartphone, Tablet, Globe, ChevronUp
 } from 'lucide-react';
 
-import { Movie, User, ActiveTab, ToastMessage } from './types';
+import { Movie, User, ActiveTab, ToastMessage, ViewMode } from './types';
 import { INITIAL_MOVIES, GENRES } from './data/mockMovies';
 
 // Firebase Integrations
 import { 
   collection, doc, setDoc, getDocs, updateDoc, deleteDoc, 
-  onSnapshot, getDocFromServer 
+  onSnapshot, getDocFromServer, query, where, orderBy, limit,
+  writeBatch, increment, serverTimestamp
 } from 'firebase/firestore';
-import { onAuthStateChanged, signOut } from 'firebase/auth';
+import { onAuthStateChanged, signOut, getIdTokenResult } from 'firebase/auth';
 import { db, auth, handleFirestoreError, OperationType } from './lib/firebase';
 
-// Subcomponents
-import Navbar from './components/Navbar';
-import HeroSection from './components/HeroSection';
-import MovieCard from './components/MovieCard';
-import MovieDetailModal from './components/MovieDetailModal';
-import SubscriptionModal from './components/SubscriptionModal';
-import AuthPage from './components/AuthPage';
-import UserProfile from './components/UserProfile';
-import AdminDashboard from './components/AdminDashboard';
-import VideoPlayerPage from './components/VideoPlayerPage';
-import ToastContainer from './components/Toast';
+// Lazy-loaded components for performance
+const Navbar = lazy(() => import('./components/Navbar'));
+const HeroSection = lazy(() => import('./components/HeroSection'));
+const MovieCard = lazy(() => import('./components/MovieCard'));
+const MovieDetailModal = lazy(() => import('./components/MovieDetailModal'));
+const SubscriptionModal = lazy(() => import('./components/SubscriptionModal'));
+const AuthPage = lazy(() => import('./components/AuthPage'));
+const UserProfile = lazy(() => import('./components/UserProfile'));
+const AdminDashboard = lazy(() => import('./components/AdminDashboard'));
+const VideoPlayerPage = lazy(() => import('./components/VideoPlayerPage'));
+const ToastContainer = lazy(() => import('./components/Toast'));
+
+// Loading fallback component
+const LoadingFallback = () => (
+  <div className="flex items-center justify-center min-h-[400px]">
+    <div className="relative">
+      <div className="w-16 h-16 border-4 border-emerald-400/20 border-t-emerald-400 rounded-full animate-spin" />
+      <Film className="w-6 h-6 text-emerald-400 absolute top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2" />
+    </div>
+  </div>
+);
+
+// Scroll to top button component
+const ScrollToTop = () => {
+  const [visible, setVisible] = useState(false);
+  
+  useEffect(() => {
+    const handleScroll = () => setVisible(window.scrollY > 500);
+    window.addEventListener('scroll', handleScroll);
+    return () => window.removeEventListener('scroll', handleScroll);
+  }, []);
+
+  if (!visible) return null;
+
+  return (
+    <button
+      onClick={() => window.scrollTo({ top: 0, behavior: 'smooth' })}
+      className="fixed bottom-24 md:bottom-8 right-8 z-50 p-3 bg-emerald-400 text-black rounded-full shadow-lg hover:shadow-emerald-400/20 transition-all hover:scale-110 active:scale-95"
+    >
+      <ChevronUp className="w-6 h-6" />
+    </button>
+  );
+};
+
+// Debounce utility
+const useDebounce = <T,>(value: T, delay: number): T => {
+  const [debouncedValue, setDebouncedValue] = useState<T>(value);
+  
+  useEffect(() => {
+    const handler = setTimeout(() => setDebouncedValue(value), delay);
+    return () => clearTimeout(handler);
+  }, [value, delay]);
+  
+  return debouncedValue;
+};
+
+// Local storage hook
+const useLocalStorage = <T,>(key: string, initialValue: T): [T, (value: T) => void] => {
+  const [storedValue, setStoredValue] = useState<T>(() => {
+    try {
+      const item = window.localStorage.getItem(key);
+      return item ? JSON.parse(item) : initialValue;
+    } catch (error) {
+      console.error(error);
+      return initialValue;
+    }
+  });
+
+  const setValue = (value: T) => {
+    try {
+      setStoredValue(value);
+      window.localStorage.setItem(key, JSON.stringify(value));
+    } catch (error) {
+      console.error(error);
+    }
+  };
+
+  return [storedValue, setValue];
+};
+
+// Analytics tracker
+const useAnalytics = () => {
+  const trackEvent = useCallback((eventName: string, data?: Record<string, any>) => {
+    // Implement analytics tracking
+    console.log(`[Analytics] ${eventName}:`, data);
+  }, []);
+
+  return { trackEvent };
+};
 
 export default function App() {
   // --- Core Application States ---
-  const [movies, setMovies] = useState<Movie[]>(INITIAL_MOVIES);
+  const [movies, setMovies] = useState<Movie[]>([]);
   const [users, setUsers] = useState<User[]>([]);
   const [currentUser, setCurrentUser] = useState<User | null>(null);
+  const [isLoading, setIsLoading] = useState(true);
   
   const [activeTab, setActiveTab] = useState<ActiveTab>('home');
   const [selectedMovie, setSelectedMovie] = useState<Movie | null>(null);
   const [currentPlayingMovie, setCurrentPlayingMovie] = useState<Movie | null>(null);
   const [isSubscriptionOpen, setIsSubscriptionOpen] = useState(false);
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
+  const [viewMode, setViewMode] = useState<ViewMode>('grid');
 
-  // --- Filtering States for Movies Tab ---
+  // --- Filtering States ---
   const [genreFilter, setGenreFilter] = useState('All');
   const [yearFilter, setYearFilter] = useState('All');
   const [searchQuery, setSearchQuery] = useState('');
   const [mediaTypeFilter, setMediaTypeFilter] = useState<'all' | 'movie' | 'series' | 'upcoming'>('all');
+  const [sortBy, setSortBy] = useState<'newest' | 'oldest' | 'popular' | 'rating'>('newest');
 
-  // --- Connection test helper ---
+  // --- UI Preferences (persisted) ---
+  const [prefersReducedMotion, setPrefersReducedMotion] = useLocalStorage('prefersReducedMotion', false);
+  const [autoplayTrailers, setAutoplayTrailers] = useLocalStorage('autoplayTrailers', true);
+
+  // --- Refs ---
+  const mainContentRef = useRef<HTMLDivElement>(null);
+  const previousRoute = useRef<ActiveTab>('home');
+
+  // --- Hooks ---
+  const debouncedSearch = useDebounce(searchQuery, 300);
+  const { trackEvent } = useAnalytics();
+
+  // --- Connection & Health Check ---
   const testConnection = async () => {
     try {
+      const startTime = performance.now();
       await getDocFromServer(doc(db, 'test', 'connection'));
-      console.log("Firebase connection established successfully.");
+      const latency = Math.round(performance.now() - startTime);
+      console.log(`Firebase connection established (${latency}ms)`);
+      return true;
     } catch (error) {
-      if (error instanceof Error && error.message.includes('offline')) {
-        console.warn("Please check your Firebase configuration: Client is offline.");
-      }
+      console.error('Firebase connection failed:', error);
+      return false;
     }
   };
 
-  // --- 1. Load & Seed Movies from Firestore ---
+  // --- Movie Data Synchronization ---
   useEffect(() => {
-    testConnection();
-
-    // Listen to real-time movies collection updates
-    const unsubscribeMovies = onSnapshot(collection(db, 'movies'), async (snapshot) => {
-      if (snapshot.empty) {
-        console.log('No movies found in Firestore. Seeding default movie catalog...');
-        try {
-          for (const movie of INITIAL_MOVIES) {
-            await setDoc(doc(db, 'movies', movie.id), movie);
+    const initializeMovies = async () => {
+      setIsLoading(true);
+      
+      // Subscribe to real-time movies
+      const q = query(collection(db, 'movies'), orderBy('createdAt', 'desc'));
+      
+      const unsubscribe = onSnapshot(q, async (snapshot) => {
+        if (snapshot.empty) {
+          console.log('Seeding initial movie catalog...');
+          const batch = writeBatch(db);
+          
+          INITIAL_MOVIES.forEach((movie) => {
+            const movieRef = doc(db, 'movies', movie.id);
+            batch.set(movieRef, {
+              ...movie,
+              createdAt: serverTimestamp(),
+              updatedAt: serverTimestamp(),
+            });
+          });
+          
+          try {
+            await batch.commit();
+            console.log('Movie catalog seeded successfully');
+            trackEvent('movies_seeded', { count: INITIAL_MOVIES.length });
+          } catch (err) {
+            handleFirestoreError(err, OperationType.WRITE, 'movies');
           }
-        } catch (err) {
-          handleFirestoreError(err, OperationType.WRITE, 'movies');
+        } else {
+          const loadedMovies: Movie[] = [];
+          snapshot.forEach((docSnap) => {
+            loadedMovies.push({ id: docSnap.id, ...docSnap.data() } as Movie);
+          });
+          setMovies(loadedMovies);
+          trackEvent('movies_loaded', { count: loadedMovies.length });
         }
-      } else {
-        const loadedMovies: Movie[] = [];
-        snapshot.forEach((docSnap) => {
-          loadedMovies.push(docSnap.data() as Movie);
-        });
-        // Sort newest first
-        loadedMovies.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
-        setMovies(loadedMovies);
-      }
-    }, (error) => {
-      handleFirestoreError(error, OperationType.GET, 'movies');
-    });
+        
+        setIsLoading(false);
+      }, (error) => {
+        handleFirestoreError(error, OperationType.GET, 'movies');
+        setIsLoading(false);
+      });
 
-    return () => {
-      unsubscribeMovies();
+      return () => unsubscribe();
     };
-  }, []);
 
-  // --- 2. Track Authentication Session & Profile ---
+    testConnection().then(initializeMovies);
+  }, [trackEvent]);
+
+  // --- Authentication State ---
   useEffect(() => {
-    const unsubscribeAuth = onAuthStateChanged(auth, (authUser) => {
+    const unsubscribe = onAuthStateChanged(auth, async (authUser) => {
       if (authUser) {
-        // Subscribe to real-time user profile document in Firestore
+        // Get custom claims for role verification
+        const tokenResult = await getIdTokenResult(authUser, true);
+        const isAdmin = tokenResult.claims.role === 'admin';
+
         const unsubscribeProfile = onSnapshot(doc(db, 'users', authUser.uid), (docSnap) => {
           if (docSnap.exists()) {
-            setCurrentUser(docSnap.data() as User);
-          } else {
-            console.warn("Auth user logged in, but Firestore profile is missing.");
+            const userData = docSnap.data() as User;
+            setCurrentUser({
+              ...userData,
+              id: authUser.uid,
+              role: isAdmin ? 'admin' : userData.role || 'user',
+            });
+            trackEvent('user_session_restored', { userId: authUser.uid });
           }
         }, (error) => {
           handleFirestoreError(error, OperationType.GET, `users/${authUser.uid}`);
@@ -111,101 +232,130 @@ export default function App() {
       }
     });
 
-    return () => {
-      unsubscribeAuth();
-    };
-  }, []);
+    return () => unsubscribe();
+  }, [trackEvent]);
 
-  // --- 3. Track Registered Users list for Admin Dashboard ---
+  // --- Admin Users List ---
   useEffect(() => {
     if (currentUser?.role !== 'admin') {
       setUsers([]);
       return;
     }
 
-    const unsubscribeUsersList = onSnapshot(collection(db, 'users'), (snapshot) => {
+    const q = query(collection(db, 'users'), orderBy('createdAt', 'desc'));
+    const unsubscribe = onSnapshot(q, (snapshot) => {
       const allUsers: User[] = [];
       snapshot.forEach((docSnap) => {
-        allUsers.push(docSnap.data() as User);
+        allUsers.push({ id: docSnap.id, ...docSnap.data() } as User);
       });
       setUsers(allUsers);
     }, (error) => {
       handleFirestoreError(error, OperationType.GET, 'users');
     });
 
-    return () => {
-      unsubscribeUsersList();
-    };
+    return () => unsubscribe();
   }, [currentUser?.role]);
 
-  // --- Synchronizing user state helper ---
-  const syncUserState = async (updatedUser: User) => {
-    try {
-      await setDoc(doc(db, 'users', updatedUser.id), updatedUser);
-    } catch (err: any) {
-      handleFirestoreError(err, OperationType.WRITE, `users/${updatedUser.id}`);
+  // --- Route Change Tracking ---
+  useEffect(() => {
+    trackEvent('route_changed', { 
+      from: previousRoute.current, 
+      to: activeTab 
+    });
+    previousRoute.current = activeTab;
+    
+    // Scroll to top on route change
+    if (mainContentRef.current) {
+      mainContentRef.current.scrollIntoView({ behavior: 'smooth' });
     }
-  };
+  }, [activeTab, trackEvent]);
 
   // --- Toast Manager ---
-  const addToast = (message: string, type: 'success' | 'error' | 'info' | 'warning' = 'info') => {
+  const addToast = useCallback((message: string, type: 'success' | 'error' | 'info' | 'warning' = 'info') => {
     const id = `toast-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
-    setToasts(prev => [...prev, { id, message, type }]);
-  };
+    setToasts(prev => [...prev.slice(-4), { id, message, type }]); // Keep max 5 toasts
+    
+    // Auto-remove toast after 5 seconds
+    setTimeout(() => {
+      setToasts(prev => prev.filter(t => t.id !== id));
+    }, 5000);
+  }, []);
 
-  const removeToast = (id: string) => {
+  const removeToast = useCallback((id: string) => {
     setToasts(prev => prev.filter(t => t.id !== id));
-  };
+  }, []);
+
+  // --- User State Sync ---
+  const syncUserState = useCallback(async (updatedUser: User) => {
+    try {
+      const userRef = doc(db, 'users', updatedUser.id);
+      await setDoc(userRef, {
+        ...updatedUser,
+        updatedAt: serverTimestamp(),
+      }, { merge: true });
+    } catch (err: any) {
+      handleFirestoreError(err, OperationType.WRITE, `users/${updatedUser.id}`);
+      throw err;
+    }
+  }, []);
 
   // --- Authentication Handlers ---
-  const handleLoginSuccess = (user: User) => {
-    addToast(`Signed in successfully as ${user.username}!`, 'success');
+  const handleLoginSuccess = useCallback((user: User) => {
+    addToast(`Welcome back, ${user.username}! 🎬`, 'success');
     setActiveTab('home');
-  };
+    trackEvent('user_login', { userId: user.id });
+  }, [addToast, trackEvent]);
 
-  const handleLogout = async () => {
+  const handleLogout = useCallback(async () => {
     try {
       await signOut(auth);
-      addToast('Logged out of Cinema session.', 'info');
+      addToast('See you soon! 👋', 'info');
       setActiveTab('home');
+      trackEvent('user_logout');
     } catch (err: any) {
-      console.error("Signout error:", err);
-      addToast(err.message || 'Failed to logout.', 'error');
+      addToast(err.message || 'Failed to logout', 'error');
     }
-  };
+  }, [addToast, trackEvent]);
 
-  // --- Subscription Action ---
-  const handleSubscribe = (planId: string, planName: string) => {
+  // --- Subscription Management ---
+  const handleSubscribe = useCallback(async (planId: string, planName: string) => {
     if (!currentUser) return;
+
     const updatedUser: User = {
       ...currentUser,
       subscription: {
         active: true,
         planId,
-        expiresAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString()
+        expiresAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(),
+        autoRenew: true,
       }
     };
-    syncUserState(updatedUser);
-    addToast(`Successfully subscribed to "${planName}"! Access granted.`, 'success');
-  };
 
-  // --- Likes Interaction ---
-  const handleLikeToggle = async (movieId: string) => {
+    try {
+      await syncUserState(updatedUser);
+      addToast(`🎉 Welcome to ${planName}! Enjoy unlimited streaming!`, 'success');
+      setIsSubscriptionOpen(false);
+      trackEvent('subscription_activated', { planId, planName });
+    } catch (err: any) {
+      addToast('Failed to activate subscription. Please try again.', 'error');
+    }
+  }, [currentUser, syncUserState, addToast, trackEvent]);
+
+  // --- Content Interactions ---
+  const handleLikeToggle = useCallback(async (movieId: string) => {
     if (!currentUser) {
-      addToast('Please sign in to like this movie.', 'warning');
+      addToast('Sign in to save your favorites! ❤️', 'warning');
       setActiveTab('auth');
       return;
     }
 
-    const isAlreadyLikedInSession = currentUser.watchlist.includes(movieId);
-    
-    // Find movie to adjust likes count
-    const movieObj = movies.find(m => m.id === movieId);
-    if (!movieObj) return;
+    const movie = movies.find(m => m.id === movieId);
+    if (!movie) return;
 
-    const updatedWatchlist = isAlreadyLikedInSession
+    const isLiked = currentUser.watchlist?.includes(movieId);
+    const updatedWatchlist = isLiked
       ? currentUser.watchlist.filter(id => id !== movieId)
-      : [...currentUser.watchlist, movieId];
+      : [...(currentUser.watchlist || []), movieId];
 
     const updatedUser: User = {
       ...currentUser,
@@ -213,34 +363,44 @@ export default function App() {
     };
 
     try {
-      // Update User Watchlist in Firestore
-      await syncUserState(updatedUser);
-      // Update Movie Likes count in Firestore
-      await updateDoc(doc(db, 'movies', movieId), {
-        likes: isAlreadyLikedInSession ? Math.max(0, movieObj.likes - 1) : movieObj.likes + 1
+      // Batch update for consistency
+      const batch = writeBatch(db);
+      
+      // Update user watchlist
+      batch.set(doc(db, 'users', currentUser.id), {
+        watchlist: updatedWatchlist,
+        updatedAt: serverTimestamp(),
+      }, { merge: true });
+      
+      // Update movie likes count
+      batch.update(doc(db, 'movies', movieId), {
+        likes: increment(isLiked ? -1 : 1),
       });
 
+      await batch.commit();
+      
       addToast(
-        isAlreadyLikedInSession ? 'Removed movie from your saved favorites.' : 'Saved to your favorites list!', 
-        isAlreadyLikedInSession ? 'info' : 'success'
+        isLiked ? 'Removed from favorites' : 'Added to favorites! ❤️',
+        isLiked ? 'info' : 'success'
       );
+      
+      trackEvent(isLiked ? 'movie_unliked' : 'movie_liked', { movieId });
     } catch (err: any) {
       handleFirestoreError(err, OperationType.UPDATE, `movies/${movieId}`);
     }
-  };
+  }, [currentUser, movies, addToast, trackEvent]);
 
-  // --- Watchlist Interaction ---
-  const handleWatchlistToggle = async (movieId: string) => {
+  const handleWatchlistToggle = useCallback(async (movieId: string) => {
     if (!currentUser) {
-      addToast('Please sign in to modify your watchlist.', 'warning');
+      addToast('Sign in to manage your watchlist!', 'warning');
       setActiveTab('auth');
       return;
     }
 
-    const isWatchlisted = currentUser.watchlist.includes(movieId);
+    const isWatchlisted = currentUser.watchlist?.includes(movieId);
     const updatedWatchlist = isWatchlisted
       ? currentUser.watchlist.filter(id => id !== movieId)
-      : [...currentUser.watchlist, movieId];
+      : [...(currentUser.watchlist || []), movieId];
 
     const updatedUser: User = {
       ...currentUser,
@@ -250,607 +410,668 @@ export default function App() {
     try {
       await syncUserState(updatedUser);
       addToast(
-        isWatchlisted ? 'Removed movie from personal Watchlist' : 'Successfully added to Watchlist!',
+        isWatchlisted ? 'Removed from watchlist' : 'Added to watchlist! 📺',
         isWatchlisted ? 'info' : 'success'
       );
+      trackEvent(isWatchlisted ? 'watchlist_remove' : 'watchlist_add', { movieId });
     } catch (err: any) {
-      handleFirestoreError(err, OperationType.UPDATE, `users/${currentUser.id}`);
+      addToast('Failed to update watchlist', 'error');
     }
-  };
+  }, [currentUser, syncUserState, addToast, trackEvent]);
 
-  // --- Video Playback Trigger with Subscription Lock ---
-  const handlePlayMovie = async (movie: Movie) => {
+  // --- Video Playback ---
+  const handlePlayMovie = useCallback(async (movie: Movie) => {
     if (!currentUser) {
-      addToast('Authentication required. Please sign in to watch full movies.', 'warning');
+      addToast('Authentication required to stream movies!', 'warning');
       setActiveTab('auth');
       return;
     }
 
     if (!currentUser.subscription?.active) {
-      addToast('Subscription required. Select an abonnement to stream movies for free.', 'info');
+      addToast('VIP subscription required for streaming! 🌟', 'info');
       setIsSubscriptionOpen(true);
       return;
     }
 
-    // Log viewer history
-    const alreadyWatchedIndex = currentUser.history.findIndex(item => item.movieId === movie.id);
-    let updatedHistory = [...currentUser.history];
-    let existingProgress = 0;
-    let existingCurrentTime = 0;
-
-    if (alreadyWatchedIndex > -1) {
-      const existingItem = currentUser.history[alreadyWatchedIndex];
-      existingProgress = existingItem.progress ?? 0;
-      existingCurrentTime = existingItem.currentTime ?? 0;
-      // Remove from old position so we can move it to the top (most recently watched)
-      updatedHistory.splice(alreadyWatchedIndex, 1);
-    }
-
-    updatedHistory.unshift({
-      movieId: movie.id,
-      watchedAt: new Date().toISOString(),
-      progress: existingProgress,
-      currentTime: existingCurrentTime
-    });
+    // Update watch history
+    const existingHistory = currentUser.history || [];
+    const historyItem = existingHistory.find(item => item.movieId === movie.id);
+    
+    const updatedHistory = [
+      {
+        movieId: movie.id,
+        watchedAt: new Date().toISOString(),
+        progress: historyItem?.progress || 0,
+        currentTime: historyItem?.currentTime || 0,
+      },
+      ...existingHistory.filter(item => item.movieId !== movie.id),
+    ].slice(0, 50); // Keep last 50 watched items
 
     const updatedUser: User = {
       ...currentUser,
-      history: updatedHistory
+      history: updatedHistory,
     };
 
     try {
-      await syncUserState(updatedUser);
-      await updateDoc(doc(db, 'movies', movie.id), {
-        views: movie.views + 1
-      });
-      addToast(`Now playing: "${movie.title}"`, 'success');
-    } catch (err: any) {
-      handleFirestoreError(err, OperationType.UPDATE, `movies/${movie.id}`);
-    } finally {
+      await Promise.all([
+        syncUserState(updatedUser),
+        updateDoc(doc(db, 'movies', movie.id), {
+          views: increment(1),
+        }),
+      ]);
+      
       setSelectedMovie(null);
       setCurrentPlayingMovie(movie);
       setActiveTab('player');
-    }
-  };
-
-  // --- Update Playback Progress dynamically from VideoPlayerPage ---
-  const handleUpdatePlaybackProgress = async (movieId: string, progress: number, currentTime: number) => {
-    if (!currentUser) return;
-
-    const alreadyWatchedIndex = currentUser.history.findIndex(item => item.movieId === movieId);
-    let updatedHistory = [...currentUser.history];
-
-    if (alreadyWatchedIndex > -1) {
-      updatedHistory[alreadyWatchedIndex] = {
-        ...updatedHistory[alreadyWatchedIndex],
-        watchedAt: new Date().toISOString(),
-        progress,
-        currentTime
-      };
-    } else {
-      updatedHistory.unshift({
-        movieId,
-        watchedAt: new Date().toISOString(),
-        progress,
-        currentTime
+      
+      trackEvent('movie_play', { 
+        movieId: movie.id, 
+        title: movie.title,
+        resumeFrom: historyItem?.progress || 0 
       });
-    }
-
-    const updatedUser: User = {
-      ...currentUser,
-      history: updatedHistory
-    };
-
-    try {
-      await syncUserState(updatedUser);
     } catch (err: any) {
-      handleFirestoreError(err, OperationType.UPDATE, `users/${currentUser.id}`);
+      handleFirestoreError(err, OperationType.UPDATE, `movies/${movie.id}`);
     }
-  };
+  }, [currentUser, syncUserState, addToast, trackEvent]);
 
-  // --- Admin Dashboard Handlers ---
-  const handleAddMovie = async (newMovie: Omit<Movie, 'id' | 'views' | 'likes' | 'createdAt'>) => {
-    const generatedId = `m-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
-    const movieWithId: Movie = {
+  // --- Admin Operations ---
+  const handleAddMovie = useCallback(async (newMovie: Omit<Movie, 'id' | 'views' | 'likes' | 'createdAt'>) => {
+    const movieId = `movie-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
+    const movieData: Movie = {
       ...newMovie,
-      id: generatedId,
-      views: 120, // default initial views
-      likes: 8,
-      createdAt: new Date().toISOString()
+      id: movieId,
+      views: 0,
+      likes: 0,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      isFeatured: false,
     };
+
     try {
-      await setDoc(doc(db, 'movies', generatedId), movieWithId);
-      addToast(`Successfully added "${movieWithId.title}" to movie catalog!`, 'success');
+      await setDoc(doc(db, 'movies', movieId), movieData);
+      addToast(`"${newMovie.title}" added to catalog! 🎬`, 'success');
+      trackEvent('admin_movie_added', { movieId });
     } catch (err: any) {
-      handleFirestoreError(err, OperationType.CREATE, `movies/${generatedId}`);
+      handleFirestoreError(err, OperationType.CREATE, `movies/${movieId}`);
+      addToast('Failed to add movie', 'error');
     }
-  };
+  }, [addToast, trackEvent]);
 
-  const handleDeleteMovie = async (id: string) => {
+  const handleDeleteMovie = useCallback(async (movieId: string) => {
     try {
-      await deleteDoc(doc(db, 'movies', id));
-      addToast("Successfully deleted movie from catalog.", "success");
+      await deleteDoc(doc(db, 'movies', movieId));
+      addToast('Movie removed from catalog', 'success');
+      trackEvent('admin_movie_deleted', { movieId });
     } catch (err: any) {
-      handleFirestoreError(err, OperationType.DELETE, `movies/${id}`);
+      handleFirestoreError(err, OperationType.DELETE, `movies/${movieId}`);
+      addToast('Failed to delete movie', 'error');
     }
-  };
+  }, [addToast, trackEvent]);
 
-  const handleUpdateUserSubscription = async (userId: string, active: boolean, planId?: string) => {
-    try {
-      await updateDoc(doc(db, 'users', userId), {
-        subscription: {
-          active,
-          planId: planId || null,
-          expiresAt: active ? new Date(Date.now() + 30*24*60*60*1000).toISOString() : null
-        }
-      });
-      addToast("Successfully updated user subscription.", "success");
-    } catch (err: any) {
-      handleFirestoreError(err, OperationType.UPDATE, `users/${userId}`);
-    }
-  };
+  // --- Computed Values ---
+  const featuredMovie = useMemo(() => {
+    const featured = movies.find(m => m.isFeatured);
+    return featured || movies[0] || null;
+  }, [movies]);
 
-  // --- Active Featured & Next Movie for Hero ---
-  const featuredMovies = movies.filter(m => m.isFeatured) || [];
-  const activeFeatured = featuredMovies.length > 0 ? featuredMovies[0] : movies[0];
-  const activeNext = movies.find(m => m.id !== activeFeatured?.id) || null;
+  const nextMovie = useMemo(() => {
+    if (!featuredMovie) return null;
+    return movies.find(m => m.id !== featuredMovie.id) || null;
+  }, [movies, featuredMovie]);
 
-  const handleSwapFeatured = async (movieToSwap: Movie) => {
-    try {
-      const promises = movies.map(m => {
-        return updateDoc(doc(db, 'movies', m.id), {
-          isFeatured: m.id === movieToSwap.id
-        });
-      });
-      await Promise.all(promises);
-      addToast(`Swapped cinematic showcase: ${movieToSwap.title}`, 'info');
-    } catch (err: any) {
-      handleFirestoreError(err, OperationType.UPDATE, 'movies');
-    }
-  };
+  const filteredMovies = useMemo(() => {
+    return movies.filter(movie => {
+      const matchSearch = movie.title.toLowerCase().includes(debouncedSearch.toLowerCase()) || 
+                          movie.genre?.toLowerCase().includes(debouncedSearch.toLowerCase());
+      const matchGenre = genreFilter === 'All' || movie.genre === genreFilter;
+      const matchYear = yearFilter === 'All' || movie.releaseYear?.toString() === yearFilter;
+      
+      let matchType = true;
+      if (mediaTypeFilter === 'movie') matchType = movie.type === 'movie';
+      else if (mediaTypeFilter === 'series') matchType = movie.type === 'series';
+      else if (mediaTypeFilter === 'upcoming') matchType = movie.status === 'upcoming';
+      
+      return matchSearch && matchGenre && matchYear && matchType;
+    }).sort((a, b) => {
+      switch (sortBy) {
+        case 'newest': return new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime();
+        case 'oldest': return new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime();
+        case 'popular': return (b.views || 0) - (a.views || 0);
+        case 'rating': return (b.rating || 0) - (a.rating || 0);
+        default: return 0;
+      }
+    });
+  }, [movies, debouncedSearch, genreFilter, yearFilter, mediaTypeFilter, sortBy]);
 
-  // --- Movie Filter Calculations ---
-  const filteredCatalog = movies.filter(movie => {
-    const matchSearch = movie.title.toLowerCase().includes(searchQuery.toLowerCase()) || 
-                        movie.genre.toLowerCase().includes(searchQuery.toLowerCase());
-    const matchGenre = genreFilter === 'All' || movie.genre === genreFilter;
-    const matchYear = yearFilter === 'All' || movie.releaseYear.toString() === yearFilter;
-    
-    // Support navbar's Tv Shows, Movies, and Upcoming filters
-    let matchType = true;
-    if (mediaTypeFilter === 'movie') {
-      matchType = movie.type !== 'series';
-    } else if (mediaTypeFilter === 'series') {
-      matchType = movie.type === 'series';
-    } else if (mediaTypeFilter === 'upcoming') {
-      matchType = movie.releaseYear >= 2025;
-    }
-    
-    return matchSearch && matchGenre && matchYear && matchType;
-  });
+  const watchHistory = useMemo(() => {
+    if (!currentUser?.history) return [];
+    return currentUser.history
+      .map(hist => {
+        const movie = movies.find(m => m.id === hist.movieId);
+        return movie ? { ...movie, ...hist } : null;
+      })
+      .filter(Boolean)
+      .slice(0, 4);
+  }, [currentUser?.history, movies]);
 
+  const trendingMovies = useMemo(() => {
+    return [...movies]
+      .sort((a, b) => (b.views || 0) - (a.views || 0))
+      .slice(0, 3);
+  }, [movies]);
+
+  // --- Render ---
   return (
-    <div id="application-root" className="min-h-screen bg-brand-bg text-slate-100 flex flex-col justify-between font-sans pb-20 md:pb-0">
-      {/* Toast Overlay */}
-      <ToastContainer toasts={toasts} removeToast={removeToast} />
+    <div className="min-h-screen bg-gradient-to-b from-gray-950 via-gray-900 to-black text-white flex flex-col selection:bg-emerald-400/20 selection:text-emerald-400">
+      {/* Toast Notifications */}
+      <Suspense fallback={null}>
+        <ToastContainer toasts={toasts} removeToast={removeToast} />
+      </Suspense>
 
-      {/* Subscription Checkout Modal */}
-      <SubscriptionModal
-        isOpen={isSubscriptionOpen}
-        onClose={() => setIsSubscriptionOpen(false)}
-        currentUser={currentUser}
-        onSubscribe={handleSubscribe}
-        onOpenAuth={() => setActiveTab('auth')}
-      />
+      {/* Subscription Modal */}
+      <Suspense fallback={null}>
+        <SubscriptionModal
+          isOpen={isSubscriptionOpen}
+          onClose={() => setIsSubscriptionOpen(false)}
+          currentUser={currentUser}
+          onSubscribe={handleSubscribe}
+          onOpenAuth={() => setActiveTab('auth')}
+        />
+      </Suspense>
 
-      {/* Movie Detailed Overlay Modal */}
-      <MovieDetailModal
-        movie={selectedMovie}
-        onClose={() => setSelectedMovie(null)}
-        currentUser={currentUser}
-        onPlay={handlePlayMovie}
-        onLikeToggle={handleLikeToggle}
-        onWatchlistToggle={handleWatchlistToggle}
-        isLiked={currentUser ? currentUser.watchlist.includes(selectedMovie?.id || '') : false}
-        isWatchlisted={currentUser ? currentUser.watchlist.includes(selectedMovie?.id || '') : false}
-        isSubscribed={currentUser ? currentUser.subscription?.active : false}
-      />
+      {/* Movie Detail Modal */}
+      <Suspense fallback={null}>
+        <MovieDetailModal
+          movie={selectedMovie}
+          onClose={() => setSelectedMovie(null)}
+          currentUser={currentUser}
+          onPlay={handlePlayMovie}
+          onLikeToggle={handleLikeToggle}
+          onWatchlistToggle={handleWatchlistToggle}
+          isLiked={currentUser?.watchlist?.includes(selectedMovie?.id || '') || false}
+          isWatchlisted={currentUser?.watchlist?.includes(selectedMovie?.id || '') || false}
+          isSubscribed={currentUser?.subscription?.active || false}
+        />
+      </Suspense>
 
-      {/* Navigation Brand Header & Floating Middle Curved Bar */}
-      <Navbar
-        activeTab={activeTab}
-        setActiveTab={setActiveTab}
-        currentUser={currentUser}
-        onLogout={handleLogout}
-        onOpenSubscription={() => setIsSubscriptionOpen(true)}
-        mediaTypeFilter={mediaTypeFilter}
-        setMediaTypeFilter={setMediaTypeFilter}
-        setGenreFilter={setGenreFilter}
-      />
+      {/* Navigation */}
+      <Suspense fallback={<div className="h-16 bg-gray-950" />}>
+        <Navbar
+          activeTab={activeTab}
+          setActiveTab={setActiveTab}
+          currentUser={currentUser}
+          onLogout={handleLogout}
+          onOpenSubscription={() => setIsSubscriptionOpen(true)}
+          mediaTypeFilter={mediaTypeFilter}
+          setMediaTypeFilter={setMediaTypeFilter}
+          setGenreFilter={setGenreFilter}
+        />
+      </Suspense>
 
-      {/* Primary Layout Router */}
-      <main className={`flex-1 w-full mx-auto ${activeTab === 'home' ? 'py-0' : 'max-w-7xl py-4 px-4'}`}>
-        {activeTab === 'home' && (
-          <div id="home-view" className="space-y-12 animate-fadeIn pb-16">
-            {/* Cinematic Hero - Edge to Edge 100vh */}
-            {activeFeatured && (
-              <HeroSection
-                featuredMovie={activeFeatured}
-                nextMovie={activeNext}
-                onPlay={handlePlayMovie}
-                onDetail={setSelectedMovie}
-                onLikeToggle={handleLikeToggle}
-                isLiked={currentUser ? currentUser.watchlist.includes(activeFeatured.id) : false}
-                onSwapFeatured={handleSwapFeatured}
-                moviesList={movies}
-              />
-            )}
-
-            {/* Rest of home content wrapped in standard container for desktop precision */}
-            <div className="max-w-7xl mx-auto space-y-16">
-              {/* Continue Watching Section */}
-              {currentUser && currentUser.history && currentUser.history.length > 0 && (
-              <section className="px-6 md:px-12 space-y-4 animate-fadeIn" id="continue-watching-section">
-                <div>
-                  <h3 className="text-2xl font-black tracking-wider text-white flex items-center gap-2 font-display uppercase">
-                    <Clock className="w-5 h-5 text-amber-500" />
-                    <span>Continue Watching</span>
-                  </h3>
-                  <p className="text-xs text-slate-400 mt-0.5">Pick up right where you left off in your cinematic journey.</p>
-                </div>
-
-                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6">
-                  {currentUser.history
-                    .map(hist => {
-                      const movie = movies.find(m => m.id === hist.movieId);
-                      return movie ? { ...movie, progress: hist.progress, currentTime: hist.currentTime || 0 } : null;
-                    })
-                    .filter((m): m is (Movie & { progress: number; currentTime: number }) => m !== null)
-                    .slice(0, 4) // Show up to 4 most recently watched movies
-                    .map((movie) => (
-                      <div
-                        key={movie.id}
-                        id={`continue-watching-card-${movie.id}`}
-                        onClick={() => handlePlayMovie(movie)}
-                        className="group bg-slate-900/40 hover:bg-slate-900 border border-slate-900 hover:border-slate-800 rounded-2xl overflow-hidden cursor-pointer transition-all hover:scale-[1.02] flex flex-col shadow-lg relative"
-                      >
-                        {/* Thumbnail Container */}
-                        <div className="relative aspect-video w-full overflow-hidden bg-slate-950">
-                          <img
-                            src={movie.thumbnailUrl}
-                            alt={movie.title}
-                            referrerPolicy="no-referrer"
-                            className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-500"
-                          />
-                          {/* Duration Badge */}
-                          <span className="absolute bottom-2 right-2 bg-slate-950/80 backdrop-blur-sm border border-slate-800/60 text-[9px] font-bold text-slate-300 px-1.5 py-0.5 rounded">
-                            {movie.duration}
-                          </span>
-                          {/* Play Hover Overlay */}
-                          <div className="absolute inset-0 bg-slate-950/50 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
-                            <div className="w-10 h-10 bg-amber-500 text-slate-950 rounded-full flex items-center justify-center font-black scale-90 group-hover:scale-100 transition-all shadow-lg shadow-amber-500/20">
-                              <PlayCircle className="w-6 h-6 fill-current ml-0.5" />
-                            </div>
-                          </div>
-                        </div>
-
-                        {/* Card Details */}
-                        <div className="p-4 flex-1 flex flex-col justify-between gap-3">
-                          <div className="space-y-1">
-                            <span className="text-[10px] font-black uppercase text-amber-500 tracking-wider">
-                              {movie.genre}
-                            </span>
-                            <h4 className="text-sm font-bold text-white leading-tight group-hover:text-amber-400 transition-colors line-clamp-1">
-                              {movie.title}
-                            </h4>
-                          </div>
-
-                          {/* Progress bar container */}
-                          <div className="space-y-1.5">
-                            <div className="flex items-center justify-between text-[10px] text-slate-400 font-mono">
-                              <span>{movie.progress}% completed</span>
-                              {movie.currentTime > 0 && (
-                                <span>{Math.floor(movie.currentTime / 60)}m left</span>
-                              )}
-                            </div>
-                            <div className="w-full h-1.5 bg-slate-950 rounded-full overflow-hidden border border-slate-900">
-                              <div
-                                className="h-full bg-gradient-to-r from-amber-500 to-orange-500 rounded-full"
-                                style={{ width: `${movie.progress}%` }}
-                              />
-                            </div>
-                          </div>
-                        </div>
-                      </div>
-                    ))}
-                </div>
-              </section>
-            )}
-
-            {/* Trending Slider Section */}
-            <section className="px-6 md:px-12 space-y-4">
-              <div className="flex items-center justify-between">
-                <div>
-                  <h3 className="text-2xl font-black tracking-wider text-white flex items-center gap-2 font-display uppercase">
-                    <Compass className="w-5 h-5 text-amber-500" />
-                    <span>Trending Masterpieces</span>
-                  </h3>
-                  <p className="text-xs text-slate-400 mt-0.5">Voted blockbusters with highest digital viewer stream counts.</p>
-                </div>
-              </div>
-
-              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6" id="home-trending-grid">
-                {movies.slice(0, 3).map((movie) => (
-                  <MovieCard
-                    key={movie.id}
-                    movie={movie}
-                    onPlay={handlePlayMovie}
-                    onDetail={setSelectedMovie}
-                    onLikeToggle={handleLikeToggle}
-                    isLiked={currentUser ? currentUser.watchlist.includes(movie.id) : false}
-                    isSubscribed={currentUser ? currentUser.subscription?.active : false}
-                  />
-                ))}
-              </div>
-            </section>
-
-            {/* Featured Collection Grid */}
-            <section className="px-6 md:px-12 pb-12 space-y-4">
-              <div className="flex items-center justify-between">
-                <div>
-                  <h3 className="text-2xl font-black tracking-wider text-white flex items-center gap-2 font-display uppercase">
-                    <Film className="w-5 h-5 text-amber-500" />
-                    <span>Browse All Content</span>
-                  </h3>
-                  <p className="text-xs text-slate-400 mt-0.5">Explore our total cinematic catalog. Filter and play movies instantly.</p>
-                </div>
-                <button
-                  id="browse-more-trigger"
-                  onClick={() => setActiveTab('movies')}
-                  className="text-xs text-amber-400 hover:text-amber-300 font-bold flex items-center gap-1 cursor-pointer"
-                >
-                  <span>Explore Catalog</span>
-                  <ArrowRight className="w-3.5 h-3.5" />
-                </button>
-              </div>
-
-              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6" id="home-catalog-grid">
-                {movies.slice(2, 5).map((movie) => (
-                  <MovieCard
-                    key={movie.id}
-                    movie={movie}
-                    onPlay={handlePlayMovie}
-                    onDetail={setSelectedMovie}
-                    onLikeToggle={handleLikeToggle}
-                    isLiked={currentUser ? currentUser.watchlist.includes(movie.id) : false}
-                    isSubscribed={currentUser ? currentUser.subscription?.active : false}
-                  />
-                ))}
-              </div>
-            </section>
-          </div>
-          </div>
-        )}
-
-        {activeTab === 'movies' && (
-          <div id="movies-catalog-view" className="px-6 md:px-12 space-y-8 animate-fadeIn">
-            <div>
-              <h2 className="text-3xl font-black font-sans tracking-tight">Cinematic Catalog</h2>
-              <p className="text-slate-400 text-xs mt-1">Refine options by genre, release year, or keywords to start playing.</p>
-            </div>
-
-            {/* Interactive Filters Panel */}
-            <div className="bg-slate-900 border border-slate-800 rounded-3xl p-6 space-y-4">
-              <div className="flex flex-col md:flex-row gap-4 justify-between items-start md:items-center">
-                {/* Genre Tabs */}
-                <div className="flex flex-wrap gap-2">
-                  {GENRES.map((g) => (
-                    <button
-                      id={`genre-tab-${g}`}
-                      key={g}
-                      onClick={() => setGenreFilter(g)}
-                      className={`px-3.5 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer border ${
-                        genreFilter === g
-                          ? 'bg-amber-500 border-amber-500 text-slate-950 font-black'
-                          : 'bg-slate-950 border-slate-850 text-slate-400 hover:text-slate-200'
-                      }`}
-                    >
-                      {g}
-                    </button>
-                  ))}
-                </div>
-
-                {/* Release Year Filter */}
-                <div className="flex items-center gap-2 w-full md:w-auto">
-                  <span className="text-xs text-slate-400 font-bold shrink-0">Year:</span>
-                  <select
-                    id="catalog-year-select"
-                    value={yearFilter}
-                    onChange={(e) => setYearFilter(e.target.value)}
-                    className="w-full md:w-40 bg-slate-950 border border-slate-850 rounded-xl text-xs px-3.5 py-2 text-slate-200 focus:outline-none focus:border-amber-500 transition-colors cursor-pointer"
-                  >
-                    <option value="All">All Release Years</option>
-                    <option value="2026">2026</option>
-                    <option value="2025">2025</option>
-                    <option value="2024">2024</option>
-                    <option value="2023">2023</option>
-                  </select>
-                </div>
-              </div>
-            </div>
-
-            {/* Movies Display */}
-            {filteredCatalog.length === 0 ? (
-              <div className="text-center py-20 bg-slate-900/40 rounded-3xl border border-slate-850/80">
-                <p className="text-slate-400 text-sm">No movies match your current filter preferences. Try adjusting query fields.</p>
-              </div>
-            ) : (
-              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6" id="catalog-movies-grid">
-                {filteredCatalog.map((movie) => (
-                  <MovieCard
-                    key={movie.id}
-                    movie={movie}
-                    onPlay={handlePlayMovie}
-                    onDetail={setSelectedMovie}
-                    onLikeToggle={handleLikeToggle}
-                    isLiked={currentUser ? currentUser.watchlist.includes(movie.id) : false}
-                    isSubscribed={currentUser ? currentUser.subscription?.active : false}
-                  />
-                ))}
-              </div>
-            )}
-          </div>
-        )}
-
-        {activeTab === 'search' && (
-          <div id="search-view" className="px-6 md:px-12 space-y-8 animate-fadeIn">
-            <div>
-              <h2 className="text-3xl font-black font-sans tracking-tight">Smart Search</h2>
-              <p className="text-slate-400 text-xs mt-1">Find exact titles by genre, keywords, actors, or release year.</p>
-            </div>
-
-            {/* Large Search Bar */}
-            <div className="max-w-2xl mx-auto">
-              <div className="relative">
-                <input
-                  id="global-search-input"
-                  type="text"
-                  value={searchQuery}
-                  onChange={(e) => setSearchQuery(e.target.value)}
-                  placeholder="Search by title, genre, directors, casting..."
-                  className="w-full bg-slate-900 border border-slate-800 focus:border-amber-500 rounded-2xl pl-12 pr-4 py-4 text-sm text-slate-100 focus:outline-none transition-all placeholder:text-slate-500 shadow-xl"
-                />
-                <Search className="w-5 h-5 text-slate-500 absolute left-4 top-1/2 -translate-y-1/2" />
-              </div>
-            </div>
-
-            {/* Results Grid */}
-            <div>
-              <h4 className="text-xs font-bold uppercase text-slate-400 tracking-wider mb-4">
-                {searchQuery ? `Search results for "${searchQuery}"` : 'All Available Titles'} ({filteredCatalog.length})
-              </h4>
-
-              {filteredCatalog.length === 0 ? (
-                <div className="text-center py-20 bg-slate-900/40 rounded-3xl border border-slate-850/80">
-                  <p className="text-slate-400 text-sm">No results match your search keywords. Try different phrases!</p>
-                </div>
-              ) : (
-                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6" id="search-results-grid">
-                  {filteredCatalog.map((movie) => (
-                    <MovieCard
-                      key={movie.id}
-                      movie={movie}
+      {/* Main Content */}
+      <main ref={mainContentRef} className="flex-1 relative">
+        {isLoading ? (
+          <LoadingFallback />
+        ) : (
+          <>
+            {/* Home View */}
+            {activeTab === 'home' && (
+              <div className="animate-fadeIn">
+                {featuredMovie && (
+                  <Suspense fallback={<LoadingFallback />}>
+                    <HeroSection
+                      featuredMovie={featuredMovie}
+                      nextMovie={nextMovie}
                       onPlay={handlePlayMovie}
                       onDetail={setSelectedMovie}
                       onLikeToggle={handleLikeToggle}
-                      isLiked={currentUser ? currentUser.watchlist.includes(movie.id) : false}
-                      isSubscribed={currentUser ? currentUser.subscription?.active : false}
+                      isLiked={currentUser?.watchlist?.includes(featuredMovie.id) || false}
+                      onSwapFeatured={(movie) => {
+                        // Implement swap featured logic
+                        const updatedMovies = movies.map(m => ({
+                          ...m,
+                          isFeatured: m.id === movie.id,
+                        }));
+                        setMovies(updatedMovies);
+                      }}
+                      moviesList={movies}
                     />
-                  ))}
+                  </Suspense>
+                )}
+
+                <div className="max-w-7xl mx-auto px-4 md:px-8 space-y-16 py-12">
+                  {/* Continue Watching */}
+                  {watchHistory.length > 0 && (
+                    <section>
+                      <div className="flex items-center justify-between mb-6">
+                        <div>
+                          <h2 className="text-2xl md:text-3xl font-black flex items-center gap-3">
+                            <Clock className="w-6 h-6 text-amber-400" />
+                            Continue Watching
+                          </h2>
+                          <p className="text-sm text-gray-400 mt-1">Pick up where you left off</p>
+                        </div>
+                      </div>
+                      
+                      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                        {watchHistory.map((item: any) => (
+                          <div
+                            key={item.id}
+                            onClick={() => handlePlayMovie(item)}
+                            className="group relative bg-gray-900/50 rounded-2xl overflow-hidden cursor-pointer hover:scale-105 transition-all duration-300 border border-gray-800/50 hover:border-emerald-400/30"
+                          >
+                            <div className="aspect-video relative">
+                              <img
+                                src={item.thumbnailUrl}
+                                alt={item.title}
+                                className="w-full h-full object-cover"
+                                loading="lazy"
+                              />
+                              <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
+                                <PlayCircle className="w-12 h-12 text-white" />
+                              </div>
+                              {/* Progress bar */}
+                              {item.progress > 0 && (
+                                <div className="absolute bottom-0 left-0 right-0 h-1 bg-gray-800">
+                                  <div
+                                    className="h-full bg-gradient-to-r from-emerald-400 to-emerald-500"
+                                    style={{ width: `${item.progress}%` }}
+                                  />
+                                </div>
+                              )}
+                            </div>
+                            <div className="p-3">
+                              <h3 className="text-sm font-bold truncate">{item.title}</h3>
+                              <p className="text-xs text-gray-400 mt-1">
+                                {item.progress}% completed
+                              </p>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </section>
+                  )}
+
+                  {/* Trending Now */}
+                  <section>
+                    <div className="flex items-center justify-between mb-6">
+                      <div>
+                        <h2 className="text-2xl md:text-3xl font-black flex items-center gap-3">
+                          <TrendingUp className="w-6 h-6 text-red-400" />
+                          Trending Now
+                        </h2>
+                        <p className="text-sm text-gray-400 mt-1">Most watched this week</p>
+                      </div>
+                    </div>
+                    
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                      {trendingMovies.map((movie) => (
+                        <Suspense key={movie.id} fallback={<LoadingFallback />}>
+                          <MovieCard
+                            movie={movie}
+                            onPlay={handlePlayMovie}
+                            onDetail={setSelectedMovie}
+                            onLikeToggle={handleLikeToggle}
+                            isLiked={currentUser?.watchlist?.includes(movie.id) || false}
+                            isSubscribed={currentUser?.subscription?.active || false}
+                          />
+                        </Suspense>
+                      ))}
+                    </div>
+                  </section>
+
+                  {/* Browse All */}
+                  <section>
+                    <div className="flex items-center justify-between mb-6">
+                      <div>
+                        <h2 className="text-2xl md:text-3xl font-black flex items-center gap-3">
+                          <Film className="w-6 h-6 text-emerald-400" />
+                          Browse All
+                        </h2>
+                        <p className="text-sm text-gray-400 mt-1">Explore our complete catalog</p>
+                      </div>
+                      <button
+                        onClick={() => setActiveTab('movies')}
+                        className="flex items-center gap-2 px-4 py-2 bg-white/5 hover:bg-white/10 rounded-xl text-sm font-semibold transition-all border border-white/10 hover:border-white/20"
+                      >
+                        View All
+                        <ArrowRight className="w-4 h-4" />
+                      </button>
+                    </div>
+                    
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                      {movies.slice(0, 3).map((movie) => (
+                        <Suspense key={movie.id} fallback={<LoadingFallback />}>
+                          <MovieCard
+                            movie={movie}
+                            onPlay={handlePlayMovie}
+                            onDetail={setSelectedMovie}
+                            onLikeToggle={handleLikeToggle}
+                            isLiked={currentUser?.watchlist?.includes(movie.id) || false}
+                            isSubscribed={currentUser?.subscription?.active || false}
+                          />
+                        </Suspense>
+                      ))}
+                    </div>
+                  </section>
                 </div>
-              )}
-            </div>
-          </div>
-        )}
+              </div>
+            )}
 
-        {activeTab === 'profile' && (
-          <UserProfile
-            currentUser={currentUser}
-            movies={movies}
-            onRemoveFromWatchlist={handleWatchlistToggle}
-            onPlayMovie={handlePlayMovie}
-            onOpenSubscription={() => setIsSubscriptionOpen(true)}
-          />
-        )}
+            {/* Movies Catalog View */}
+            {activeTab === 'movies' && (
+              <div className="max-w-7xl mx-auto px-4 md:px-8 py-8 animate-fadeIn">
+                <div className="mb-8">
+                  <h1 className="text-3xl md:text-4xl font-black">Movie Catalog</h1>
+                  <p className="text-gray-400 mt-2">Discover your next favorite film</p>
+                </div>
 
-        {activeTab === 'admin' && currentUser?.role === 'admin' && (
-          <div className="px-6 md:px-12">
-            <AdminDashboard
-              movies={movies}
-              users={users}
-              onAddMovie={handleAddMovie}
-              onDeleteMovie={handleDeleteMovie}
-              onUpdateUserSubscription={handleUpdateUserSubscription}
-              addToast={addToast}
-            />
-          </div>
-        )}
+                {/* Filters */}
+                <div className="bg-gray-900/50 backdrop-blur-sm rounded-2xl p-6 mb-8 border border-gray-800/50">
+                  <div className="flex flex-wrap gap-4 items-center">
+                    {/* Genre Filter */}
+                    <div className="flex flex-wrap gap-2">
+                      {GENRES.map((genre) => (
+                        <button
+                          key={genre}
+                          onClick={() => setGenreFilter(genre)}
+                          className={`px-4 py-2 rounded-xl text-sm font-semibold transition-all ${
+                            genreFilter === genre
+                              ? 'bg-emerald-400 text-black'
+                              : 'bg-white/5 text-gray-400 hover:bg-white/10 hover:text-white'
+                          }`}
+                        >
+                          {genre}
+                        </button>
+                      ))}
+                    </div>
 
-        {activeTab === 'auth' && (
-          <AuthPage onLoginSuccess={handleLoginSuccess} addToast={addToast} />
-        )}
+                    {/* Year Filter */}
+                    <select
+                      value={yearFilter}
+                      onChange={(e) => setYearFilter(e.target.value)}
+                      className="px-4 py-2 bg-white/5 border border-gray-800 rounded-xl text-sm text-white focus:outline-none focus:border-emerald-400"
+                    >
+                      <option value="All">All Years</option>
+                      {[2026, 2025, 2024, 2023, 2022].map(year => (
+                        <option key={year} value={year}>{year}</option>
+                      ))}
+                    </select>
 
-        {activeTab === 'player' && currentPlayingMovie && (
-          <VideoPlayerPage
-            movie={currentPlayingMovie}
-            allMovies={movies}
-            currentUser={currentUser}
-            onLikeToggle={handleLikeToggle}
-            onWatchlistToggle={handleWatchlistToggle}
-            onPlayMovie={handlePlayMovie}
-            onBack={() => setActiveTab('home')}
-            addToast={addToast}
-            onUpdateHistory={handleUpdatePlaybackProgress}
-          />
+                    {/* Sort */}
+                    <select
+                      value={sortBy}
+                      onChange={(e) => setSortBy(e.target.value as any)}
+                      className="px-4 py-2 bg-white/5 border border-gray-800 rounded-xl text-sm text-white focus:outline-none focus:border-emerald-400"
+                    >
+                      <option value="newest">Newest First</option>
+                      <option value="oldest">Oldest First</option>
+                      <option value="popular">Most Popular</option>
+                      <option value="rating">Highest Rated</option>
+                    </select>
+                  </div>
+                </div>
+
+                {/* Results */}
+                {filteredMovies.length === 0 ? (
+                  <div className="text-center py-20">
+                    <Film className="w-16 h-16 text-gray-700 mx-auto mb-4" />
+                    <p className="text-gray-400">No movies found matching your criteria</p>
+                    <button
+                      onClick={() => {
+                        setGenreFilter('All');
+                        setYearFilter('All');
+                        setSearchQuery('');
+                      }}
+                      className="mt-4 px-6 py-2 bg-emerald-400 text-black rounded-xl font-semibold hover:bg-emerald-300 transition-all"
+                    >
+                      Clear Filters
+                    </button>
+                  </div>
+                ) : (
+                  <div className="grid grid-cols-1 md:grid-cols-3 lg:grid-cols-4 gap-6">
+                    {filteredMovies.map((movie) => (
+                      <Suspense key={movie.id} fallback={<LoadingFallback />}>
+                        <MovieCard
+                          movie={movie}
+                          onPlay={handlePlayMovie}
+                          onDetail={setSelectedMovie}
+                          onLikeToggle={handleLikeToggle}
+                          isLiked={currentUser?.watchlist?.includes(movie.id) || false}
+                          isSubscribed={currentUser?.subscription?.active || false}
+                        />
+                      </Suspense>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Search View */}
+            {activeTab === 'search' && (
+              <div className="max-w-7xl mx-auto px-4 md:px-8 py-8 animate-fadeIn">
+                <div className="max-w-2xl mx-auto mb-12">
+                  <h1 className="text-3xl md:text-4xl font-black text-center mb-8">Search</h1>
+                  <div className="relative">
+                    <Search className="absolute left-4 top-1/2 -translate-y-1/2 w-5 h-5 text-gray-400" />
+                    <input
+                      type="text"
+                      value={searchQuery}
+                      onChange={(e) => setSearchQuery(e.target.value)}
+                      placeholder="Search movies, genres, actors..."
+                      className="w-full pl-12 pr-4 py-4 bg-gray-900/50 backdrop-blur-sm border border-gray-800 rounded-2xl text-white placeholder-gray-500 focus:outline-none focus:border-emerald-400 transition-all"
+                      autoFocus
+                    />
+                  </div>
+                </div>
+
+                {searchQuery && (
+                  <div className="grid grid-cols-1 md:grid-cols-3 lg:grid-cols-4 gap-6">
+                    {filteredMovies.map((movie) => (
+                      <Suspense key={movie.id} fallback={<LoadingFallback />}>
+                        <MovieCard
+                          movie={movie}
+                          onPlay={handlePlayMovie}
+                          onDetail={setSelectedMovie}
+                          onLikeToggle={handleLikeToggle}
+                          isLiked={currentUser?.watchlist?.includes(movie.id) || false}
+                          isSubscribed={currentUser?.subscription?.active || false}
+                        />
+                      </Suspense>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Profile View */}
+            {activeTab === 'profile' && (
+              <Suspense fallback={<LoadingFallback />}>
+                <UserProfile
+                  currentUser={currentUser}
+                  movies={movies}
+                  onRemoveFromWatchlist={handleWatchlistToggle}
+                  onPlayMovie={handlePlayMovie}
+                  onOpenSubscription={() => setIsSubscriptionOpen(true)}
+                />
+              </Suspense>
+            )}
+
+            {/* Admin View */}
+            {activeTab === 'admin' && currentUser?.role === 'admin' && (
+              <Suspense fallback={<LoadingFallback />}>
+                <AdminDashboard
+                  movies={movies}
+                  users={users}
+                  onAddMovie={handleAddMovie}
+                  onDeleteMovie={handleDeleteMovie}
+                  onUpdateUserSubscription={async (userId, active, planId) => {
+                    try {
+                      await updateDoc(doc(db, 'users', userId), {
+                        subscription: {
+                          active,
+                          planId: planId || null,
+                          expiresAt: active ? new Date(Date.now() + 30*24*60*60*1000).toISOString() : null,
+                        },
+                      });
+                      addToast('User subscription updated', 'success');
+                    } catch (err) {
+                      addToast('Failed to update subscription', 'error');
+                    }
+                  }}
+                  addToast={addToast}
+                />
+              </Suspense>
+            )}
+
+            {/* Auth View */}
+            {activeTab === 'auth' && (
+              <Suspense fallback={<LoadingFallback />}>
+                <AuthPage onLoginSuccess={handleLoginSuccess} addToast={addToast} />
+              </Suspense>
+            )}
+
+            {/* Video Player View */}
+            {activeTab === 'player' && currentPlayingMovie && (
+              <Suspense fallback={<LoadingFallback />}>
+                <VideoPlayerPage
+                  movie={currentPlayingMovie}
+                  allMovies={movies}
+                  currentUser={currentUser}
+                  onLikeToggle={handleLikeToggle}
+                  onWatchlistToggle={handleWatchlistToggle}
+                  onPlayMovie={handlePlayMovie}
+                  onBack={() => setActiveTab('home')}
+                  addToast={addToast}
+                  onUpdateHistory={async (movieId, progress, currentTime) => {
+                    if (!currentUser) return;
+                    const updatedHistory = currentUser.history?.map(item =>
+                      item.movieId === movieId
+                        ? { ...item, progress, currentTime, watchedAt: new Date().toISOString() }
+                        : item
+                    ) || [];
+                    
+                    try {
+                      await syncUserState({ ...currentUser, history: updatedHistory });
+                    } catch (err) {
+                      console.error('Failed to update playback progress:', err);
+                    }
+                  }}
+                />
+              </Suspense>
+            )}
+          </>
         )}
       </main>
 
-      {/* MOBILE BOTTOM TAB BAR (Responsive Constraint) */}
-      <nav 
-        id="mobile-bottom-tab-bar"
-        className="fixed bottom-4 left-4 right-4 mx-auto max-w-sm z-50 bg-[#070101]/95 border border-[#1b0303] backdrop-blur-lg flex items-center justify-around py-2.5 md:hidden px-4 rounded-2xl shadow-2xl shadow-black/80"
-      >
-        <button
-          id="mobile-tab-home"
-          onClick={() => setActiveTab('home')}
-          className={`flex flex-col items-center gap-1 cursor-pointer transition-colors ${
-            activeTab === 'home' ? 'text-[#00E600]' : 'text-slate-400'
-          }`}
-        >
-          <Home className="w-4 h-4" />
-          <span className="text-[8px] font-bold uppercase tracking-wider">Home</span>
-        </button>
-
-        <button
-          id="mobile-tab-movies"
-          onClick={() => setActiveTab('movies')}
-          className={`flex flex-col items-center gap-1 cursor-pointer transition-colors ${
-            activeTab === 'movies' ? 'text-[#00E600]' : 'text-slate-400'
-          }`}
-        >
-          <Film className="w-4 h-4" />
-          <span className="text-[8px] font-bold uppercase tracking-wider">Catalog</span>
-        </button>
-
-        <button
-          id="mobile-tab-search"
-          onClick={() => setActiveTab('search')}
-          className={`flex flex-col items-center justify-center cursor-pointer transition-all ${
-            activeTab === 'search' 
-              ? 'relative -top-5 w-11 h-11 rounded-full bg-gradient-to-tr from-[#00E600] to-[#00E6A2] text-slate-950 shadow-lg shadow-teal-950/40 border-2 border-[#070101] scale-110' 
-              : 'relative -top-3 w-9 h-9 rounded-full bg-slate-900 text-slate-300 border border-slate-800 shadow-md shadow-black/40 hover:scale-105'
-          }`}
-        >
-          <Search className="w-3.5 h-3.5 font-bold" />
-        </button>
-
-        <button
-          id="mobile-tab-profile"
-          onClick={() => setActiveTab(currentUser ? 'profile' : 'auth')}
-          className={`flex flex-col items-center gap-1 cursor-pointer transition-colors ${
-            activeTab === 'profile' || activeTab === 'auth' ? 'text-[#00E600]' : 'text-slate-400'
-          }`}
-        >
-          <UserIcon className="w-4 h-4" />
-          <span className="text-[8px] font-bold uppercase tracking-wider">Cinema</span>
-        </button>
+      {/* Mobile Bottom Navigation */}
+      <nav className="fixed bottom-0 left-0 right-0 md:hidden bg-gray-950/95 backdrop-blur-xl border-t border-gray-800/50 safe-area-inset-bottom">
+        <div className="flex items-center justify-around py-3">
+          {[
+            { id: 'home', icon: Home, label: 'Home' },
+            { id: 'movies', icon: Film, label: 'Browse' },
+            { id: 'search', icon: Search, label: 'Search' },
+            { id: 'profile', icon: UserIcon, label: 'Profile' },
+          ].map(({ id, icon: Icon, label }) => (
+            <button
+              key={id}
+              onClick={() => setActiveTab(id as ActiveTab)}
+              className={`flex flex-col items-center gap-1 px-4 py-1 transition-all ${
+                activeTab === id
+                  ? 'text-emerald-400 scale-110'
+                  : 'text-gray-500 hover:text-gray-300'
+              }`}
+            >
+              <Icon className="w-5 h-5" />
+              <span className="text-[10px] font-semibold">{label}</span>
+            </button>
+          ))}
+        </div>
       </nav>
 
-      {/* Modern Global Cinematic Footer */}
-      <footer className="w-full border-t border-[#1b0303] bg-[#070101] mt-16 py-8 px-6 text-center text-xs text-slate-500">
-        <p className="font-medium tracking-wide">© 2026 CineLand Networks. Powered by Cloudinary & VIP Premium Abonnements.</p>
-        <p className="text-[10px] text-slate-600 mt-1">Frictionless high-contrast mockup database. All rights reserved.</p>
+      {/* Scroll to Top Button */}
+      <ScrollToTop />
+
+      {/* Footer */}
+      <footer className="hidden md:block border-t border-gray-800/50 bg-gray-950/50 backdrop-blur-sm">
+        <div className="max-w-7xl mx-auto px-4 md:px-8 py-8">
+          <div className="grid grid-cols-1 md:grid-cols-4 gap-8">
+            <div>
+              <h3 className="font-black text-lg mb-4 flex items-center gap-2">
+                <Film className="w-5 h-5 text-emerald-400" />
+                CineLand
+              </h3>
+              <p className="text-sm text-gray-400">
+                Your premium streaming destination for movies and TV shows.
+              </p>
+            </div>
+            
+            <div>
+              <h4 className="font-bold text-sm mb-4 uppercase tracking-wider text-gray-300">Browse</h4>
+              <div className="space-y-2 text-sm text-gray-400">
+                <button onClick={() => setActiveTab('movies')} className="block hover:text-white transition-colors">Movies</button>
+                <button onClick={() => { setMediaTypeFilter('series'); setActiveTab('movies'); }} className="block hover:text-white transition-colors">TV Shows</button>
+                <button onClick={() => { setMediaTypeFilter('upcoming'); setActiveTab('movies'); }} className="block hover:text-white transition-colors">Coming Soon</button>
+              </div>
+            </div>
+
+            <div>
+              <h4 className="font-bold text-sm mb-4 uppercase tracking-wider text-gray-300">Account</h4>
+              <div className="space-y-2 text-sm text-gray-400">
+                <button onClick={() => setActiveTab(currentUser ? 'profile' : 'auth')} className="block hover:text-white transition-colors">
+                  {currentUser ? 'My Profile' : 'Sign In'}
+                </button>
+                <button onClick={() => setIsSubscriptionOpen(true)} className="block hover:text-white transition-colors">
+                  Subscription
+                </button>
+                {currentUser && (
+                  <button onClick={handleLogout} className="block hover:text-red-400 transition-colors">
+                    Sign Out
+                  </button>
+                )}
+              </div>
+            </div>
+
+            <div>
+              <h4 className="font-bold text-sm mb-4 uppercase tracking-wider text-gray-300">Connect</h4>
+              <div className="flex gap-3">
+                {[Monitor, Smartphone, Tablet, Globe].map((Icon, i) => (
+                  <div key={i} className="p-2 bg-white/5 rounded-lg hover:bg-white/10 transition-all cursor-pointer">
+                    <Icon className="w-4 h-4 text-gray-400" />
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+
+          <div className="mt-8 pt-8 border-t border-gray-800/50 text-center text-sm text-gray-500">
+            <p>© 2026 CineLand. All rights reserved. Powered by advanced streaming technology.</p>
+          </div>
+        </div>
       </footer>
+
+      {/* Custom Styles */}
+      <style>{`
+        @keyframes fadeIn {
+          from { opacity: 0; transform: translateY(10px); }
+          to { opacity: 1; transform: translateY(0); }
+        }
+        .animate-fadeIn {
+          animation: fadeIn 0.5s ease-out;
+        }
+        
+        .safe-area-inset-bottom {
+          padding-bottom: env(safe-area-inset-bottom);
+        }
+
+        @media (prefers-reduced-motion: reduce) {
+          *, *::before, *::after {
+            animation-duration: 0.01ms !important;
+            animation-iteration-count: 1 !important;
+            transition-duration: 0.01ms !important;
+          }
+        }
+      `}</style>
     </div>
   );
 }
