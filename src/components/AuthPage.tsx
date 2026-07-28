@@ -330,7 +330,7 @@ export default function AuthPage({ onLoginSuccess, addToast }: AuthPageProps) {
                 transition={{ duration: 2, repeat: Infinity }}
               />
             </div>
-            <span className="text-2xl font-black text-white tracking-tight">CineLand</span>
+            <span className="text-2xl font-black text-white tracking-tight">StreamMax</span>
           </motion.div>
           
           <motion.p

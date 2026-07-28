@@ -156,7 +156,7 @@ export default function HeroSection({
     <div
       ref={heroRef}
       id="hero-section"
-      className="relative w-full min-h-screen md:h-[100vh] bg-black overflow-hidden flex flex-col justify-between -mt-[88px] select-none"
+      className="relative w-full min-h-screen md:h-[100vh] bg-black overflow-hidden flex flex-col justify-between pt-20 md:pt-24 select-none"
     >
       {/* Advanced Particle System */}
       <div className="absolute inset-0 z-[1] pointer-events-none overflow-hidden">

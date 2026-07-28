@@ -78,7 +78,7 @@ function AnimatedLogo() {
         {/* Brand text with gradient animation */}
         <h1 className="text-3xl font-black tracking-tighter relative">
           <span className="text-transparent bg-clip-text bg-gradient-to-r from-emerald-400 via-green-400 to-emerald-300 animate-gradient-x">
-            CineLand
+            StreamMax
           </span>
           {/* Subtle underline animation */}
           <span className="absolute -bottom-1 left-0 w-full h-0.5 bg-gradient-to-r from-transparent via-emerald-400 to-transparent transform scale-x-0 group-hover:scale-x-100 transition-transform duration-500" />

@@ -999,7 +999,7 @@ export default function App() {
             <div>
               <h3 className="font-black text-lg mb-4 flex items-center gap-2">
                 <Film className="w-5 h-5 text-emerald-400" />
-                CineLand
+                StreamMax
               </h3>
               <p className="text-sm text-gray-400">
                 Your premium streaming destination for movies and TV shows.
@@ -1045,7 +1045,7 @@ export default function App() {
           </div>
 
           <div className="mt-8 pt-8 border-t border-gray-800/50 text-center text-sm text-gray-500">
-            <p>© 2026 CineLand. All rights reserved. Powered by advanced streaming technology.</p>
+            <p>© 2026 StreamMax. All rights reserved. Powered by advanced streaming technology.</p>
           </div>
         </div>
       </footer>

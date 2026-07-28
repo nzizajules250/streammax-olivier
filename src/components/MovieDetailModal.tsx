@@ -245,7 +245,7 @@ export default function MovieDetailModal({
 
   const handleShare = async (platform: string) => {
     const url = window.location.href;
-    const text = `Check out "${movie.title}" on CineLand!`;
+    const text = `Check out "${movie.title}" on StreamMax!`;
     
     switch(platform) {
       case 'copy':
