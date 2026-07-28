@@ -100,7 +100,6 @@ const useLocalStorage = <T,>(key: string, initialValue: T): [T, (value: T) => vo
 // Analytics tracker
 const useAnalytics = () => {
   const trackEvent = useCallback((eventName: string, data?: Record<string, any>) => {
-    // Implement analytics tracking
     console.log(`[Analytics] ${eventName}:`, data);
   }, []);
 
@@ -159,7 +158,6 @@ export default function App() {
     const initializeMovies = async () => {
       setIsLoading(true);
       
-      // Subscribe to real-time movies
       const q = query(collection(db, 'movies'), orderBy('createdAt', 'desc'));
       
       const unsubscribe = onSnapshot(q, async (snapshot) => {
@@ -208,7 +206,6 @@ export default function App() {
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, async (authUser) => {
       if (authUser) {
-        // Get custom claims for role verification
         const tokenResult = await getIdTokenResult(authUser, true);
         const isAdmin = tokenResult.claims.role === 'admin';
 
@@ -264,7 +261,6 @@ export default function App() {
     });
     previousRoute.current = activeTab;
     
-    // Scroll to top on route change
     if (mainContentRef.current) {
       mainContentRef.current.scrollIntoView({ behavior: 'smooth' });
     }
@@ -273,9 +269,8 @@ export default function App() {
   // --- Toast Manager ---
   const addToast = useCallback((message: string, type: 'success' | 'error' | 'info' | 'warning' = 'info') => {
     const id = `toast-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
-    setToasts(prev => [...prev.slice(-4), { id, message, type }]); // Keep max 5 toasts
+    setToasts(prev => [...prev.slice(-4), { id, message, type }]);
     
-    // Auto-remove toast after 5 seconds
     setTimeout(() => {
       setToasts(prev => prev.filter(t => t.id !== id));
     }, 5000);
@@ -363,16 +358,13 @@ export default function App() {
     };
 
     try {
-      // Batch update for consistency
       const batch = writeBatch(db);
       
-      // Update user watchlist
       batch.set(doc(db, 'users', currentUser.id), {
         watchlist: updatedWatchlist,
         updatedAt: serverTimestamp(),
       }, { merge: true });
       
-      // Update movie likes count
       batch.update(doc(db, 'movies', movieId), {
         likes: increment(isLiked ? -1 : 1),
       });
@@ -433,7 +425,6 @@ export default function App() {
       return;
     }
 
-    // Update watch history
     const existingHistory = currentUser.history || [];
     const historyItem = existingHistory.find(item => item.movieId === movie.id);
     
@@ -445,7 +436,7 @@ export default function App() {
         currentTime: historyItem?.currentTime || 0,
       },
       ...existingHistory.filter(item => item.movieId !== movie.id),
-    ].slice(0, 50); // Keep last 50 watched items
+    ].slice(0, 50);
 
     const updatedUser: User = {
       ...currentUser,
@@ -494,6 +485,21 @@ export default function App() {
     } catch (err: any) {
       handleFirestoreError(err, OperationType.CREATE, `movies/${movieId}`);
       addToast('Failed to add movie', 'error');
+    }
+  }, [addToast, trackEvent]);
+
+  const handleEditMovie = useCallback(async (id: string, updates: Partial<Movie>) => {
+    try {
+      const movieRef = doc(db, 'movies', id);
+      await updateDoc(movieRef, {
+        ...updates,
+        updatedAt: serverTimestamp(),
+      });
+      addToast(`Movie updated successfully! 🎬`, 'success');
+      trackEvent('admin_movie_updated', { movieId: id });
+    } catch (err: any) {
+      handleFirestoreError(err, OperationType.UPDATE, `movies/${id}`);
+      addToast('Failed to update movie', 'error');
     }
   }, [addToast, trackEvent]);
 
@@ -627,7 +633,6 @@ export default function App() {
                       onLikeToggle={handleLikeToggle}
                       isLiked={currentUser?.watchlist?.includes(featuredMovie.id) || false}
                       onSwapFeatured={(movie) => {
-                        // Implement swap featured logic
                         const updatedMovies = movies.map(m => ({
                           ...m,
                           isFeatured: m.id === movie.id,
@@ -670,7 +675,6 @@ export default function App() {
                               <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
                                 <PlayCircle className="w-12 h-12 text-white" />
                               </div>
-                              {/* Progress bar */}
                               {item.progress > 0 && (
                                 <div className="absolute bottom-0 left-0 right-0 h-1 bg-gray-800">
                                   <div
@@ -766,10 +770,8 @@ export default function App() {
                   <p className="text-gray-400 mt-2">Discover your next favorite film</p>
                 </div>
 
-                {/* Filters */}
                 <div className="bg-gray-900/50 backdrop-blur-sm rounded-2xl p-6 mb-8 border border-gray-800/50">
                   <div className="flex flex-wrap gap-4 items-center">
-                    {/* Genre Filter */}
                     <div className="flex flex-wrap gap-2">
                       {GENRES.map((genre) => (
                         <button
@@ -786,7 +788,6 @@ export default function App() {
                       ))}
                     </div>
 
-                    {/* Year Filter */}
                     <select
                       value={yearFilter}
                       onChange={(e) => setYearFilter(e.target.value)}
@@ -798,7 +799,6 @@ export default function App() {
                       ))}
                     </select>
 
-                    {/* Sort */}
                     <select
                       value={sortBy}
                       onChange={(e) => setSortBy(e.target.value as any)}
@@ -812,7 +812,6 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* Results */}
                 {filteredMovies.length === 0 ? (
                   <div className="text-center py-20">
                     <Film className="w-16 h-16 text-gray-700 mx-auto mb-4" />
@@ -904,6 +903,7 @@ export default function App() {
                   movies={movies}
                   users={users}
                   onAddMovie={handleAddMovie}
+                  onEditMovie={handleEditMovie}
                   onDeleteMovie={handleDeleteMovie}
                   onUpdateUserSubscription={async (userId, active, planId) => {
                     try {

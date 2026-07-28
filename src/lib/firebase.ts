@@ -1,6 +1,7 @@
 import { initializeApp } from 'firebase/app';
-import { getAuth } from 'firebase/auth';
-import { initializeFirestore } from 'firebase/firestore';
+import { getAuth, onAuthStateChanged, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut } from 'firebase/auth';
+import { initializeFirestore, collection, doc, setDoc, getDoc, getDocs, query, orderBy, deleteDoc, updateDoc, arrayUnion, arrayRemove } from 'firebase/firestore';
+import { getStorage, ref, uploadBytes, getDownloadURL, deleteObject, listAll } from 'firebase/storage';
 import firebaseConfig from '../../firebase-applet-config.json';
 
 const app = initializeApp({
@@ -18,6 +19,12 @@ export const auth = getAuth(app);
 export const db = firebaseConfig.firestoreDatabaseId 
   ? initializeFirestore(app, {}, firebaseConfig.firestoreDatabaseId)
   : initializeFirestore(app, {});
+
+// Initialize Storage
+export const storage = getStorage(app);
+
+// Export storage and auth/firestore helper functions
+export { ref, uploadBytes, getDownloadURL, deleteObject, listAll, collection, doc, setDoc, getDoc, getDocs, query, orderBy, deleteDoc, updateDoc, arrayUnion, arrayRemove, onAuthStateChanged, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut };
 
 export enum OperationType {
   CREATE = 'create',

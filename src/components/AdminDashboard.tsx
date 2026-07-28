@@ -8,115 +8,31 @@ import {
   ChevronDown, ChevronUp, MoreVertical, PieChart, LineChart, 
   Shield, Crown, UserCheck, UserX, Monitor, Smartphone, Tablet,
   Bell, MessageSquare, ThumbsUp, Share2, Flag, Image, Video,
-  FileText, Layers, Sliders, Maximize2, Minimize2, Copy, Link
+  FileText, Layers, Sliders, Maximize2, Minimize2, Copy, Link,
+  Loader2, Database
 } from 'lucide-react';
-import { Movie, User, PlatformStats, Episode } from '../types';
+import { Movie, User, Episode } from '../types';
 import { GENRES } from '../data/mockMovies';
-import { uploadToCloudinary } from '../lib/cloudinary';
+import { uploadToCloudinary, uploadFromUrl } from '../lib/cloudinary';
+import * as firebaseService from '../lib/firebaseService';
+import { auth, onAuthStateChanged } from '../lib/firebase';
 
 interface AdminDashboardProps {
-  movies: Movie[];
-  users: User[];
-  onAddMovie: (newMovie: Omit<Movie, 'id' | 'views' | 'likes' | 'createdAt'>) => void;
-  onDeleteMovie: (id: string) => void;
-  onUpdateUserSubscription: (userId: string, active: boolean, planId?: string) => void;
+  // These are now optional as we'll use Firebase directly
+  initialMovies?: Movie[];
+  initialUsers?: User[];
+  onAddMovie?: (newMovie: Omit<Movie, 'id' | 'views' | 'likes' | 'createdAt'>) => void;
+  onEditMovie?: (id: string, updates: Partial<Movie>) => void;
+  onDeleteMovie?: (id: string) => void;
+  onUpdateUserSubscription?: (userId: string, active: boolean, planId?: string) => void;
   addToast: (msg: string, type: 'success' | 'error' | 'info' | 'warning') => void;
 }
 
-// Animated counter component
-const AnimatedCounter = ({ value, prefix = '', suffix = '' }: { value: number; prefix?: string; suffix?: string }) => {
-  const [displayValue, setDisplayValue] = useState(0);
-  
-  useEffect(() => {
-    const duration = 1000;
-    const steps = 60;
-    const increment = value / steps;
-    let current = 0;
-    const timer = setInterval(() => {
-      current += increment;
-      if (current >= value) {
-        setDisplayValue(value);
-        clearInterval(timer);
-      } else {
-        setDisplayValue(Math.floor(current));
-      }
-    }, duration / steps);
-    
-    return () => clearInterval(timer);
-  }, [value]);
-  
-  return <span>{prefix}{displayValue.toLocaleString()}{suffix}</span>;
-};
-
-// Progress ring component
-const ProgressRing = ({ progress, size = 60, strokeWidth = 4, color = '#f59e0b' }: { progress: number; size?: number; strokeWidth?: number; color?: string }) => {
-  const radius = (size - strokeWidth) / 2;
-  const circumference = radius * 2 * Math.PI;
-  const offset = circumference - (progress / 100) * circumference;
-  
-  return (
-    <svg width={size} height={size} className="transform -rotate-90">
-      <circle
-        cx={size / 2}
-        cy={size / 2}
-        r={radius}
-        stroke="rgba(255,255,255,0.1)"
-        strokeWidth={strokeWidth}
-        fill="none"
-      />
-      <circle
-        cx={size / 2}
-        cy={size / 2}
-        r={radius}
-        stroke={color}
-        strokeWidth={strokeWidth}
-        fill="none"
-        strokeLinecap="round"
-        strokeDasharray={circumference}
-        strokeDashoffset={offset}
-        className="transition-all duration-1000"
-      />
-      <text
-        x="50%"
-        y="50%"
-        textAnchor="middle"
-        dy="0.3em"
-        className="transform rotate-90"
-        fill="white"
-        fontSize="12"
-        fontWeight="bold"
-      >
-        {progress}%
-      </text>
-    </svg>
-  );
-};
-
-// Real-time clock component
-const RealTimeClock = () => {
-  const [time, setTime] = useState(new Date());
-  
-  useEffect(() => {
-    const timer = setInterval(() => setTime(new Date()), 1000);
-    return () => clearInterval(timer);
-  }, []);
-  
-  return (
-    <div className="text-right">
-      <div className="text-sm font-bold text-white">
-        {time.toLocaleTimeString('en-US', { hour12: false })}
-      </div>
-      <div className="text-[10px] text-gray-400">
-        {time.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' })}
-      </div>
-    </div>
-  );
-};
-
 export default function AdminDashboard({
-  movies,
-  users,
+  initialMovies = [],
+  initialUsers = [],
   onAddMovie,
+  onEditMovie,
   onDeleteMovie,
   onUpdateUserSubscription,
   addToast
@@ -124,6 +40,13 @@ export default function AdminDashboard({
   // Tab management
   const [adminTab, setAdminTab] = useState<'analytics' | 'add-movie' | 'movies-list' | 'users' | 'settings'>('analytics');
   const [isFullscreen, setIsFullscreen] = useState(false);
+  
+  // State for data
+  const [movies, setMovies] = useState<Movie[]>(initialMovies);
+  const [users, setUsers] = useState<User[]>(initialUsers);
+  const [isLoading, setIsLoading] = useState(true);
+  const [isSyncing, setIsSyncing] = useState(false);
+  const [isAuthenticated, setIsAuthenticated] = useState(false);
   
   // Movie form state
   const [title, setTitle] = useState('');
@@ -137,6 +60,8 @@ export default function AdminDashboard({
   const [videoUrl, setVideoUrl] = useState('');
   const [contentType, setContentType] = useState<'movie' | 'series'>('movie');
   const [episodes, setEpisodes] = useState<Episode[]>([]);
+  const [isEditing, setIsEditing] = useState(false);
+  const [editingMovieId, setEditingMovieId] = useState<string | null>(null);
   
   // Upload states
   const [thumbnailSourceMode, setThumbnailSourceMode] = useState<'upload' | 'url'>('upload');
@@ -171,7 +96,108 @@ export default function AdminDashboard({
   const videoInputRef = useRef<HTMLInputElement>(null);
   const episodesInputRef = useRef<HTMLInputElement>(null);
 
-  // Real-time stats calculation
+  // ============ FIREBASE DATA FETCHING ============
+  
+  const fetchData = async () => {
+    setIsLoading(true);
+    try {
+      // Fetch movies from Firebase
+      const fetchedMovies = await firebaseService.getAllMovies();
+      setMovies(fetchedMovies);
+      
+      // Fetch users from Firebase
+      const fetchedUsers = await firebaseService.getAllUsers();
+      setUsers(fetchedUsers);
+      
+      addToast('Data synchronized with Firebase', 'success');
+    } catch (error) {
+      console.error('Error fetching data:', error);
+      addToast('Failed to fetch data from Firebase', 'error');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  // Load data on mount
+  useEffect(() => {
+    // Check authentication
+    const unsubscribe = onAuthStateChanged(auth, (user) => {
+      setIsAuthenticated(!!user);
+      if (user) {
+        fetchData();
+      } else {
+        setIsLoading(false);
+        // You might want to redirect to login here
+      }
+    });
+    
+    return () => unsubscribe();
+  }, []);
+
+  // ============ CRUD OPERATIONS ============
+  
+  const handleAddMovie = async (movieData: Omit<Movie, 'id' | 'views' | 'likes' | 'createdAt'>) => {
+    try {
+      const newMovie = await firebaseService.addMovie(movieData);
+      setMovies(prev => [newMovie, ...prev]);
+      addToast('Movie added successfully!', 'success');
+      return newMovie;
+    } catch (error) {
+      console.error('Error adding movie:', error);
+      addToast('Failed to add movie', 'error');
+      throw error;
+    }
+  };
+
+  const handleEditMovie = async (id: string, updates: Partial<Movie>) => {
+    try {
+      await firebaseService.updateMovie(id, updates);
+      setMovies(prev => prev.map(m => m.id === id ? { ...m, ...updates } : m));
+      addToast('Movie updated successfully!', 'success');
+    } catch (error) {
+      console.error('Error updating movie:', error);
+      addToast('Failed to update movie', 'error');
+      throw error;
+    }
+  };
+
+  const handleDeleteMovie = async (id: string) => {
+    if (!window.confirm('Are you sure you want to delete this movie?')) return;
+    
+    try {
+      await firebaseService.deleteMovie(id);
+      setMovies(prev => prev.filter(m => m.id !== id));
+      addToast('Movie deleted successfully!', 'success');
+    } catch (error) {
+      console.error('Error deleting movie:', error);
+      addToast('Failed to delete movie', 'error');
+    }
+  };
+
+  const handleUpdateUserSubscription = async (userId: string, active: boolean, planId: string = 'gold') => {
+    try {
+      await firebaseService.updateUserSubscription(userId, active, planId);
+      setUsers(prev => prev.map(u => 
+        u.id === userId 
+          ? { 
+              ...u, 
+              subscription: { 
+                active, 
+                planId, 
+                expiresAt: active ? new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString() : '' 
+              } 
+            } 
+          : u
+      ));
+      addToast(`User subscription ${active ? 'activated' : 'deactivated'}!`, 'success');
+    } catch (error) {
+      console.error('Error updating subscription:', error);
+      addToast('Failed to update subscription', 'error');
+    }
+  };
+
+  // ============ REAL-TIME STATS ============
+  
   const stats = useMemo(() => ({
     totalViews: movies.reduce((sum, m) => sum + (m.views || 0), 0),
     totalLikes: movies.reduce((sum, m) => sum + (m.likes || 0), 0),
@@ -197,7 +223,7 @@ export default function AdminDashboard({
   // Simulated real-time data
   const [activeUsers, setActiveUsers] = useState(0);
   const [bandwidthUsage, setBandwidthUsage] = useState(0);
-  
+    
   useEffect(() => {
     const interval = setInterval(() => {
       setActiveUsers(Math.floor(Math.random() * 100) + 50);
@@ -206,57 +232,175 @@ export default function AdminDashboard({
     return () => clearInterval(interval);
   }, []);
 
-  // Cloudinary handlers
-  const saveCloudinaryConfig = (cloud: string, preset: string) => {
-    setCloudinaryCloudName(cloud);
-    setCloudinaryUploadPreset(preset);
-    localStorage.setItem('cloudinary_cloud_name', cloud);
-    localStorage.setItem('cloudinary_upload_preset', preset);
-    addToast('Cloudinary configuration saved!', 'success');
+  // ============ FORM HANDLERS ============
+
+  const startEdit = (movie: Movie) => {
+    setTitle(movie.title || '');
+    setDescription(movie.description || '');
+    setGenre(movie.genre || 'Action');
+    setReleaseYear(movie.releaseYear || 2026);
+    setDuration(movie.duration || '2h 10m');
+    setRating(movie.rating || 'PG-13');
+    setCastStr((movie.cast || []).join(', '));
+    setThumbnailUrl(movie.thumbnailUrl || '');
+    setVideoUrl(movie.videoUrl || '');
+    setContentType((movie.type as 'movie' | 'series') || 'movie');
+    setEpisodes(movie.episodes || []);
+    setIsEditing(true);
+    setEditingMovieId(movie.id);
+    setAdminTab('add-movie');
   };
 
-  const simulateUpload = (file: File, type: 'thumbnail' | 'video') => {
-    const setProgress = type === 'thumbnail' ? setThumbnailUploadProgress : setVideoUploadProgress;
-    const setUploading = type === 'thumbnail' ? setIsUploadingThumbnail : setIsUploadingVideo;
-    const setUrl = type === 'thumbnail' ? setThumbnailUrl : setVideoUrl;
-    
-    setUploading(true);
-    setProgress(0);
-    
-    let progress = 0;
-    const interval = setInterval(() => {
-      progress += Math.random() * 30;
-      if (progress >= 100) {
-        progress = 100;
-        clearInterval(interval);
-        setTimeout(() => {
-          setUploading(false);
-          const mockUrl = `https://res.cloudinary.com/demo/${type === 'thumbnail' ? 'image' : 'video'}/upload/v${Date.now()}/${file.name}`;
-          setUrl(mockUrl);
-          addToast(`[Demo] ${type === 'thumbnail' ? 'Poster' : 'Video'} uploaded successfully!`, 'success');
-        }, 500);
-      }
-      setProgress(Math.min(progress, 100));
-    }, 200);
+  const cancelEdit = () => {
+    setTitle('');
+    setDescription('');
+    setGenre('Action');
+    setReleaseYear(2026);
+    setDuration('2h 10m');
+    setRating('PG-13');
+    setCastStr('');
+    setThumbnailUrl('');
+    setVideoUrl('');
+    setEpisodes([]);
+    setContentType('movie');
+    setIsEditing(false);
+    setEditingMovieId(null);
+    setAdminTab('movies-list');
   };
+
+  const isCloudinaryUrl = (url?: string) => {
+    if (!url) return false;
+    try {
+      return url.includes('res.cloudinary.com') || (cloudinaryCloudName && url.includes(cloudinaryCloudName));
+    } catch { return false; }
+  };
+
+  const handleFormSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+  
+    if (!title || !description || !thumbnailUrl) {
+      addToast('Please fill all required fields', 'error');
+      return;
+    }
+  
+    if (contentType === 'series' && episodes.length === 0) {
+      addToast('Add at least one episode for series', 'error');
+      return;
+    }
+
+    let finalThumbnail = thumbnailUrl;
+    let finalVideo = videoUrl;
+    let finalEpisodes = [...episodes];
+
+    // If Cloudinary is configured, copy remote assets
+    try {
+      if (cloudinaryCloudName && cloudinaryUploadPreset) {
+        // Thumbnail
+        if (thumbnailSourceMode === 'url' && thumbnailUrl && !isCloudinaryUrl(thumbnailUrl)) {
+          setIsUploadingThumbnail(true);
+          try {
+            finalThumbnail = await uploadFromUrl(thumbnailUrl, cloudinaryCloudName, cloudinaryUploadPreset, setThumbnailUploadProgress);
+            setThumbnailUrl(finalThumbnail);
+            addToast('Thumbnail copied to Cloudinary', 'success');
+          } catch (err: any) {
+            addToast('Failed to copy thumbnail to Cloudinary: ' + (err.message || err), 'warning');
+          } finally {
+            setIsUploadingThumbnail(false);
+          }
+        }
+
+        // Video
+        if (videoSourceMode === 'url' && videoUrl && !isCloudinaryUrl(videoUrl)) {
+          setIsUploadingVideo(true);
+          try {
+            finalVideo = await uploadFromUrl(videoUrl, cloudinaryCloudName, cloudinaryUploadPreset, setVideoUploadProgress);
+            setVideoUrl(finalVideo);
+            addToast('Video copied to Cloudinary', 'success');
+          } catch (err: any) {
+            addToast('Failed to copy video to Cloudinary: ' + (err.message || err), 'warning');
+          } finally {
+            setIsUploadingVideo(false);
+          }
+        }
+
+        // Episodes
+        if (contentType === 'series' && finalEpisodes.length > 0) {
+          for (let i = 0; i < finalEpisodes.length; i++) {
+            const ep = finalEpisodes[i];
+            if (ep.videoUrl && !isCloudinaryUrl(ep.videoUrl)) {
+              setIsUploadingEpisodes(true);
+              try {
+                const uploaded = await uploadFromUrl(ep.videoUrl, cloudinaryCloudName, cloudinaryUploadPreset, (p) => setEpisodesUploadProgress(p));
+                finalEpisodes[i] = { ...ep, videoUrl: uploaded };
+                addToast(`Episode ${ep.episodeNumber} copied to Cloudinary`, 'success');
+              } catch (err: any) {
+                addToast(`Failed to copy episode ${ep.episodeNumber}: ${err.message || err}`, 'warning');
+              } finally {
+                setIsUploadingEpisodes(false);
+              }
+            }
+          }
+        }
+      }
+    } catch (err) {
+      console.error('Error while copying assets to Cloudinary:', err);
+    }
+
+    const payload = {
+      title,
+      description,
+      genre,
+      releaseYear,
+      duration: contentType === 'series' ? `${finalEpisodes.length} Episodes` : duration,
+      rating,
+      cast: castStr.split(',').map(s => s.trim()).filter(Boolean),
+      thumbnailUrl: finalThumbnail,
+      trailerUrl: finalVideo || finalEpisodes[0]?.videoUrl || '',
+      videoUrl: finalVideo || finalEpisodes[0]?.videoUrl || '',
+      isFeatured: false,
+      type: contentType,
+      episodes: contentType === 'series' ? finalEpisodes : undefined,
+    } as Omit<Movie, 'id' | 'views' | 'likes' | 'createdAt'>;
+
+    if (isEditing && editingMovieId) {
+      await handleEditMovie(editingMovieId, payload);
+    } else {
+      await handleAddMovie(payload);
+    }
+  
+    // Reset form
+    setTitle('');
+    setDescription('');
+    setGenre('Action');
+    setReleaseYear(2026);
+    setDuration('2h 10m');
+    setRating('PG-13');
+    setCastStr('');
+    setThumbnailUrl('');
+    setVideoUrl('');
+    setEpisodes([]);
+    setContentType('movie');
+    setIsEditing(false);
+    setEditingMovieId(null);
+    setAdminTab('movies-list');
+  };
+
+  // ============ UPLOAD HANDLERS ============
 
   const handleThumbnailUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
     
-    if (!cloudinaryCloudName || !cloudinaryUploadPreset) {
-      simulateUpload(file, 'thumbnail');
-      return;
-    }
-    
     setIsUploadingThumbnail(true);
+    setThumbnailUploadProgress(0);
+    
     try {
       const url = await uploadToCloudinary(file, cloudinaryCloudName, cloudinaryUploadPreset, setThumbnailUploadProgress);
       setThumbnailUrl(url);
-      addToast('Poster uploaded to Cloudinary!', 'success');
+      addToast('Poster uploaded successfully!', 'success');
     } catch (err) {
-      addToast('Upload failed, using demo mode', 'warning');
-      simulateUpload(file, 'thumbnail');
+      console.error('Upload error:', err);
+      addToast('Upload failed', 'error');
     } finally {
       setIsUploadingThumbnail(false);
     }
@@ -266,19 +410,16 @@ export default function AdminDashboard({
     const file = e.target.files?.[0];
     if (!file) return;
     
-    if (!cloudinaryCloudName || !cloudinaryUploadPreset) {
-      simulateUpload(file, 'video');
-      return;
-    }
-    
     setIsUploadingVideo(true);
+    setVideoUploadProgress(0);
+    
     try {
       const url = await uploadToCloudinary(file, cloudinaryCloudName, cloudinaryUploadPreset, setVideoUploadProgress);
       setVideoUrl(url);
-      addToast('Video uploaded to Cloudinary!', 'success');
+      addToast('Video uploaded successfully!', 'success');
     } catch (err) {
-      addToast('Upload failed, using demo mode', 'warning');
-      simulateUpload(file, 'video');
+      console.error('Upload error:', err);
+      addToast('Video upload failed', 'error');
     } finally {
       setIsUploadingVideo(false);
     }
@@ -293,37 +434,21 @@ export default function AdminDashboard({
     
     for (let i = 0; i < files.length; i++) {
       const file = files[i];
-      setEpisodesUploadProgress(0);
-      
-      let url = '';
-      if (!cloudinaryCloudName || !cloudinaryUploadPreset) {
-        await new Promise<void>(resolve => {
-          let p = 0;
-          const int = setInterval(() => {
-            p += 25;
-            setEpisodesUploadProgress(Math.min(p, 100));
-            if (p >= 100) { clearInterval(int); resolve(); }
-          }, 150);
+      try {
+        const url = await uploadToCloudinary(file, cloudinaryCloudName, cloudinaryUploadPreset, (p) => setEpisodesUploadProgress(p));
+        newEpisodes.push({
+          id: `ep-${Date.now()}-${i}`,
+          episodeNumber: newEpisodes.length + 1,
+          seasonNumber: 1,
+          title: file.name.replace(/\.[^/.]+$/, ""),
+          duration: '45m',
+          videoUrl: url
         });
-        url = `https://res.cloudinary.com/demo/video/upload/ep${newEpisodes.length + 1}.mp4`;
-      } else {
-        try {
-          url = await uploadToCloudinary(file, cloudinaryCloudName, cloudinaryUploadPreset, setEpisodesUploadProgress);
-        } catch {
-          url = `https://res.cloudinary.com/demo/video/upload/ep${newEpisodes.length + 1}.mp4`;
-        }
+        setEpisodes([...newEpisodes]);
+      } catch (error) {
+        console.error('Episode upload failed:', error);
+        addToast(`Failed to upload episode ${i + 1}`, 'error');
       }
-      
-      newEpisodes.push({
-        id: `ep-${Date.now()}-${i}`,
-        episodeNumber: newEpisodes.length + 1,
-        seasonNumber: 1,
-        title: file.name.replace(/\.[^/.]+$/, ""),
-        duration: '45m',
-        videoUrl: url
-      });
-      
-      setEpisodes([...newEpisodes]);
     }
     
     setIsUploadingEpisodes(false);
@@ -348,53 +473,16 @@ export default function AdminDashboard({
     addToast(`${urls.length} episodes added!`, 'success');
   };
 
-  const handleFormSubmit = (e: React.FormEvent) => {
-    e.preventDefault();
-    
-    if (!title || !description || !thumbnailUrl) {
-      addToast('Please fill all required fields', 'error');
-      return;
-    }
-    
-    if (contentType === 'series' && episodes.length === 0) {
-      addToast('Add at least one episode for series', 'error');
-      return;
-    }
-    
-    onAddMovie({
-      title,
-      description,
-      genre,
-      releaseYear,
-      duration: contentType === 'series' ? `${episodes.length} Episodes` : duration,
-      rating,
-      cast: castStr.split(',').map(s => s.trim()).filter(Boolean),
-      thumbnailUrl,
-      trailerUrl: videoUrl || episodes[0]?.videoUrl || '',
-      videoUrl: videoUrl || episodes[0]?.videoUrl || '',
-      isFeatured: false,
-      type: contentType,
-      episodes: contentType === 'series' ? episodes : undefined,
-    });
-    
-    // Reset form
-    setTitle('');
-    setDescription('');
-    setGenre('Action');
-    setReleaseYear(2026);
-    setDuration('2h 10m');
-    setRating('PG-13');
-    setCastStr('');
-    setThumbnailUrl('');
-    setVideoUrl('');
-    setEpisodes([]);
-    setContentType('movie');
-    
-    addToast('Content published successfully!', 'success');
-    setAdminTab('movies-list');
+  const saveCloudinaryConfig = (cloud: string, preset: string) => {
+    setCloudinaryCloudName(cloud);
+    setCloudinaryUploadPreset(preset);
+    localStorage.setItem('cloudinary_cloud_name', cloud);
+    localStorage.setItem('cloudinary_upload_preset', preset);
+    addToast('Cloudinary configuration saved!', 'success');
   };
 
-  // Filter and sort users
+  // ============ FILTERED USERS ============
+  
   const filteredUsers = useMemo(() => {
     return users
       .filter(u => 
@@ -411,103 +499,128 @@ export default function AdminDashboard({
       });
   }, [users, searchUsers, sortUsersBy]);
 
+  // ============ LOADING STATE ============
+  
+  if (isLoading) {
+    return (
+      <div className="min-h-screen bg-gray-950 flex items-center justify-center">
+        <div className="text-center">
+          <Loader2 className="w-12 h-12 text-amber-400 animate-spin mx-auto mb-4" />
+          <p className="text-gray-400 font-semibold">Loading dashboard...</p>
+          <p className="text-sm text-gray-500 mt-1">Connecting to Firebase</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (!isAuthenticated) {
+    return (
+      <div className="min-h-screen bg-gray-950 flex items-center justify-center">
+        <div className="text-center">
+          <Shield className="w-16 h-16 text-amber-400 mx-auto mb-4" />
+          <h2 className="text-2xl font-black text-white mb-2">Authentication Required</h2>
+          <p className="text-gray-400">Please sign in to access the admin dashboard</p>
+          <button 
+            onClick={() => window.location.href = '/login'}
+            className="mt-4 px-6 py-3 bg-amber-500 text-black font-bold rounded-xl hover:bg-amber-400 transition-all"
+          >
+            Sign In
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // ============ RENDER DASHBOARD ============
+  
   return (
-    <div className={`bg-gray-950 text-white ${isFullscreen ? 'fixed inset-0 z-50' : 'min-h-screen'}`}>
-      {/* Header */}
-      <div className="border-b border-gray-800/50 bg-gray-900/50 backdrop-blur-sm sticky top-0 z-40">
-        <div className="max-w-7xl mx-auto px-6 py-4">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-4">
-              <div className="w-10 h-10 bg-gradient-to-br from-amber-400 to-orange-600 rounded-xl flex items-center justify-center">
-                <Shield className="w-5 h-5 text-white" />
+    <div className={`bg-[#05070f] text-white ${isFullscreen ? 'fixed inset-0 z-50' : 'min-h-screen'}`}>
+      <div className="min-h-screen bg-[radial-gradient(circle_at_top_right,_rgba(248,208,36,0.18),_transparent_28%),radial-gradient(circle_at_bottom_left,_rgba(14,165,233,0.12),_transparent_30%),linear-gradient(180deg,#02040a_0%,#0f172a_100%)]">
+        {/* Header */}
+        <div className="sticky top-0 z-40 border-b border-white/10 backdrop-blur-xl bg-slate-950/80">
+          <div className="max-w-7xl mx-auto px-6 py-4">
+            <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
+              <div className="flex items-center gap-4">
+                <div className="w-12 h-12 rounded-3xl bg-gradient-to-br from-amber-400 to-orange-500 shadow-lg shadow-amber-500/20 flex items-center justify-center">
+                  <Shield className="w-5 h-5 text-slate-950" />
+                </div>
+                <div>
+                  <h1 className="text-2xl md:text-3xl font-black tracking-tight">Admin Console</h1>
+                  <p className="text-sm text-slate-400 mt-1">Manage content, users, and analytics in one polished dashboard.</p>
+                </div>
               </div>
-              <div>
-                <h1 className="text-xl font-black">Admin Console</h1>
-                <p className="text-xs text-gray-400">Platform Management</p>
+
+              <div className="flex flex-wrap items-center gap-3">
+                <button
+                  onClick={fetchData}
+                  disabled={isSyncing}
+                  className="inline-flex items-center gap-2 rounded-2xl border border-slate-700 bg-slate-900/80 px-4 py-2 text-sm font-semibold text-slate-100 transition hover:border-amber-400/40 hover:bg-slate-900"
+                >
+                  <RefreshCw className={`w-4 h-4 ${isSyncing ? 'animate-spin' : ''}`} />
+                  Sync Data
+                </button>
+
+                <div className="inline-flex items-center gap-2 rounded-2xl bg-emerald-500/10 px-4 py-2 text-sm font-semibold text-emerald-300 border border-emerald-500/20">
+                  <span className="h-2 w-2 rounded-full bg-emerald-400 animate-pulse" />
+                  Live Mode
+                </div>
+
+                <button
+                  onClick={() => setIsFullscreen(!isFullscreen)}
+                  className="inline-flex h-11 w-11 items-center justify-center rounded-2xl border border-slate-700 bg-slate-900/90 text-slate-100 transition hover:border-white/20"
+                >
+                  {isFullscreen ? <Minimize2 className="w-5 h-5" /> : <Maximize2 className="w-5 h-5" />}
+                </button>
               </div>
-            </div>
-            
-            <div className="flex items-center gap-4">
-              <RealTimeClock />
-              <div className="flex items-center gap-2 px-3 py-1.5 bg-green-500/10 border border-green-500/20 rounded-lg">
-                <div className="w-2 h-2 bg-green-400 rounded-full animate-pulse" />
-                <span className="text-xs text-green-400 font-semibold">System Online</span>
-              </div>
-              <button
-                onClick={() => setIsFullscreen(!isFullscreen)}
-                className="p-2 hover:bg-white/5 rounded-lg transition-colors"
-              >
-                {isFullscreen ? <Minimize2 className="w-4 h-4" /> : <Maximize2 className="w-4 h-4" />}
-              </button>
             </div>
           </div>
         </div>
-      </div>
 
-      <div className="max-w-7xl mx-auto px-6 py-8">
-        <div className="flex gap-8">
+        <div className="max-w-7xl mx-auto px-6 py-8">
+          <div className="grid gap-8 lg:grid-cols-[280px_1fr]">
           {/* Sidebar */}
-          <div className="w-64 shrink-0 space-y-2">
-            <nav className="space-y-1">
-              {[
-                { id: 'analytics', label: 'Analytics', icon: BarChart3, color: 'amber' },
-                { id: 'add-movie', label: 'Add Content', icon: PlusCircle, color: 'green' },
-                { id: 'movies-list', label: 'Content Library', icon: Film, color: 'blue' },
-                { id: 'users', label: 'User Management', icon: Users, color: 'purple' },
-                { id: 'settings', label: 'Settings', icon: Settings, color: 'gray' },
-              ].map(({ id, label, icon: Icon, color }) => (
-                <button
-                  key={id}
-                  onClick={() => setAdminTab(id as any)}
-                  className={`w-full flex items-center gap-3 px-4 py-3 rounded-xl text-sm font-semibold transition-all group ${
-                    adminTab === id
-                      ? 'bg-white/10 text-white shadow-lg'
-                      : 'text-gray-400 hover:text-white hover:bg-white/5'
-                  }`}
-                >
-                  <Icon className={`w-4 h-4 ${
-                    adminTab === id ? 'text-amber-400' : 'text-gray-500 group-hover:text-gray-300'
-                  }`} />
-                  <span>{label}</span>
-                  {id === 'analytics' && (
-                    <span className="ml-auto w-5 h-5 bg-red-500 text-white text-[10px] font-bold rounded-full flex items-center justify-center">
-                      {stats.totalMovies + stats.totalSeries}
-                    </span>
-                  )}
-                </button>
-              ))}
-            </nav>
+          <div className="space-y-4 rounded-3xl border border-white/10 bg-slate-950/80 p-4 shadow-2xl shadow-slate-950/20 backdrop-blur-xl">
+            <div className="rounded-3xl bg-slate-900/80 p-4 border border-slate-800/60">
+              <p className="text-xs text-slate-400 uppercase tracking-[0.2em] mb-3">Navigation</p>
+              <nav className="space-y-2">
+                {[
+                  { id: 'analytics', label: 'Analytics', icon: BarChart3 },
+                  { id: 'add-movie', label: 'Add Content', icon: PlusCircle },
+                  { id: 'movies-list', label: 'Library', icon: Film },
+                  { id: 'users', label: 'Users', icon: Users },
+                  { id: 'settings', label: 'Settings', icon: Settings },
+                ].map(({ id, label, icon: Icon }) => (
+                  <button
+                    key={id}
+                    onClick={() => setAdminTab(id as any)}
+                    className={`w-full flex items-center gap-3 rounded-3xl px-4 py-3 text-sm font-semibold transition-all ${
+                      adminTab === id
+                        ? 'bg-gradient-to-r from-amber-400 to-orange-500 text-slate-950 shadow-lg shadow-amber-500/20'
+                        : 'text-slate-400 hover:bg-white/5 hover:text-white'
+                    }`}
+                  >
+                    <Icon className={`w-4 h-4 ${adminTab === id ? 'text-slate-950' : 'text-slate-500'}`} />
+                    <span>{label}</span>
+                  </button>
+                ))}
+              </nav>
+            </div>
 
             {/* Quick Stats Card */}
-            <div className="mt-6 p-4 bg-gray-900/50 rounded-2xl border border-gray-800/50">
-              <h3 className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-3">System Health</h3>
-              <div className="space-y-3">
-                <div>
-                  <div className="flex justify-between text-xs mb-1">
-                    <span className="text-gray-400">CPU Usage</span>
-                    <span className="text-green-400 font-bold">23%</span>
-                  </div>
-                  <div className="h-1.5 bg-gray-800 rounded-full overflow-hidden">
-                    <div className="h-full bg-gradient-to-r from-green-400 to-emerald-400 rounded-full" style={{ width: '23%' }} />
-                  </div>
+            <div className="rounded-3xl bg-slate-900/80 p-5 border border-slate-800/60 shadow-inner shadow-slate-950/10">
+              <h3 className="text-xs font-bold uppercase tracking-[0.2em] text-slate-400 mb-4">Snapshot</h3>
+              <div className="space-y-4">
+                <div className="rounded-3xl bg-slate-950/70 p-4 border border-slate-800/60">
+                  <p className="text-xs text-slate-400">Total content</p>
+                  <h4 className="mt-2 text-2xl font-black text-white">{movies.length}</h4>
                 </div>
-                <div>
-                  <div className="flex justify-between text-xs mb-1">
-                    <span className="text-gray-400">Storage</span>
-                    <span className="text-amber-400 font-bold">{stats.storageUsed}GB</span>
-                  </div>
-                  <div className="h-1.5 bg-gray-800 rounded-full overflow-hidden">
-                    <div className="h-full bg-gradient-to-r from-amber-400 to-orange-400 rounded-full" style={{ width: '45%' }} />
-                  </div>
+                <div className="rounded-3xl bg-slate-950/70 p-4 border border-slate-800/60">
+                  <p className="text-xs text-slate-400">VIP Members</p>
+                  <h4 className="mt-2 text-2xl font-black text-amber-300">{stats.subscribedUsers}</h4>
                 </div>
-                <div>
-                  <div className="flex justify-between text-xs mb-1">
-                    <span className="text-gray-400">Bandwidth</span>
-                    <span className="text-blue-400 font-bold">{bandwidthUsage} Mbps</span>
-                  </div>
-                  <div className="h-1.5 bg-gray-800 rounded-full overflow-hidden">
-                    <div className="h-full bg-gradient-to-r from-blue-400 to-cyan-400 rounded-full" style={{ width: `${(bandwidthUsage / 1000) * 100}%` }} />
-                  </div>
+                <div className="rounded-3xl bg-slate-950/70 p-4 border border-slate-800/60">
+                  <p className="text-xs text-slate-400">Active users</p>
+                  <h4 className="mt-2 text-2xl font-black text-green-300">{activeUsers}</h4>
                 </div>
               </div>
             </div>
@@ -523,9 +636,9 @@ export default function AdminDashboard({
                   initial={{ opacity: 0, y: 20 }}
                   animate={{ opacity: 1, y: 0 }}
                   exit={{ opacity: 0, y: -20 }}
-                  className="space-y-6"
+                  className="space-y-8"
                 >
-                  <div className="grid grid-cols-4 gap-4">
+                  <div className="grid gap-4 xl:grid-cols-4 lg:grid-cols-2">
                     {[
                       { label: 'Total Views', value: stats.totalViews, icon: Eye, color: 'from-blue-500 to-cyan-500', change: '+12.5%' },
                       { label: 'Active Users', value: activeUsers, icon: Users, color: 'from-green-500 to-emerald-500', change: '+5.2%' },
@@ -537,27 +650,27 @@ export default function AdminDashboard({
                         initial={{ opacity: 0, y: 20 }}
                         animate={{ opacity: 1, y: 0 }}
                         transition={{ delay: i * 0.1 }}
-                        className="bg-gray-900/50 backdrop-blur-sm border border-gray-800/50 rounded-2xl p-6 hover:border-gray-700/50 transition-all"
+                        className="rounded-[2rem] border border-white/10 bg-slate-900/70 p-6 shadow-2xl shadow-slate-950/10 backdrop-blur-xl"
                       >
                         <div className="flex items-center justify-between mb-4">
-                          <span className="text-xs font-bold text-gray-400 uppercase tracking-wider">{stat.label}</span>
-                          <div className={`p-2 rounded-xl bg-gradient-to-br ${stat.color}`}>
-                            <stat.icon className="w-4 h-4 text-white" />
+                          <span className="text-xs font-bold uppercase tracking-[0.2em] text-slate-400">{stat.label}</span>
+                          <div className={`grid h-10 w-10 place-items-center rounded-3xl bg-gradient-to-br ${stat.color}`}>
+                            <stat.icon className="w-5 h-5 text-white" />
                           </div>
                         </div>
-                        <div className="text-3xl font-black">
-                          <AnimatedCounter value={stat.value} prefix={stat.prefix} />
+                        <div className="text-3xl font-black text-white">
+                          {stat.prefix}{stat.value.toLocaleString()}
                         </div>
-                        <span className="text-xs text-green-400 font-semibold mt-1 block">{stat.change}</span>
+                        <span className="text-xs text-emerald-400 font-semibold mt-1 block">{stat.change}</span>
                       </motion.div>
                     ))}
                   </div>
 
                   {/* Charts Grid */}
-                  <div className="grid grid-cols-2 gap-6">
+                  <div className="grid gap-6 lg:grid-cols-2">
                     {/* Traffic Chart */}
-                    <div className="bg-gray-900/50 border border-gray-800/50 rounded-2xl p-6">
-                      <h3 className="text-sm font-bold mb-4 flex items-center gap-2">
+                    <div className="rounded-[2rem] border border-white/10 bg-slate-900/70 p-6 shadow-2xl shadow-slate-950/10 backdrop-blur-xl">
+                      <h3 className="text-sm font-bold tracking-[0.15em] uppercase text-slate-300 mb-4 flex items-center gap-2">
                         <Activity className="w-4 h-4 text-amber-400" />
                         Traffic Overview
                       </h3>
@@ -584,8 +697,8 @@ export default function AdminDashboard({
                     </div>
 
                     {/* Genre Distribution */}
-                    <div className="bg-gray-900/50 border border-gray-800/50 rounded-2xl p-6">
-                      <h3 className="text-sm font-bold mb-4 flex items-center gap-2">
+                    <div className="rounded-[2rem] border border-white/10 bg-slate-900/70 p-6 shadow-2xl shadow-slate-950/10 backdrop-blur-xl">
+                      <h3 className="text-sm font-bold tracking-[0.15em] uppercase text-slate-300 mb-4 flex items-center gap-2">
                         <PieChart className="w-4 h-4 text-purple-400" />
                         Genre Distribution
                       </h3>
@@ -607,7 +720,7 @@ export default function AdminDashboard({
                               <div className="h-2 bg-gray-800 rounded-full overflow-hidden">
                                 <motion.div
                                   initial={{ width: 0 }}
-                                  animate={{ width: `${(count / movies.length) * 100}%` }}
+                                  animate={{ width: `${(movies.length ? (count / movies.length) * 100 : 0)}%` }}
                                   className="h-full bg-gradient-to-r from-purple-500 to-pink-500 rounded-full"
                                 />
                               </div>
@@ -618,25 +731,22 @@ export default function AdminDashboard({
                   </div>
 
                   {/* Recent Activity */}
-                  <div className="bg-gray-900/50 border border-gray-800/50 rounded-2xl p-6">
-                    <h3 className="text-sm font-bold mb-4 flex items-center gap-2">
-                      <Bell className="w-4 h-4 text-blue-400" />
-                      Recent Activity
+                  <div className="rounded-[2rem] border border-white/10 bg-slate-900/70 p-6 shadow-2xl shadow-slate-950/10 backdrop-blur-xl">
+                    <h3 className="text-sm font-bold tracking-[0.15em] uppercase text-slate-300 mb-4 flex items-center gap-2">
+                      <Bell className="w-4 h-4 text-sky-400" />
+                      Platform Activity
                     </h3>
                     <div className="space-y-3">
-                      {[
-                        { icon: Play, text: 'New movie "Dune: Part Two" started streaming', time: '2 min ago', color: 'text-green-400' },
-                        { icon: UserCheck, text: 'User "cinephile42" upgraded to VIP', time: '15 min ago', color: 'text-amber-400' },
-                        { icon: Upload, text: 'Content upload completed successfully', time: '1 hour ago', color: 'text-blue-400' },
-                        { icon: Star, text: '"Interstellar" reached 10K likes milestone', time: '3 hours ago', color: 'text-yellow-400' },
-                      ].map((item, i) => (
+                      {movies.slice(0, 5).map((movie, i) => (
                         <div key={i} className="flex items-center gap-3 p-3 hover:bg-white/5 rounded-xl transition-colors">
                           <div className={`p-2 rounded-lg bg-white/5`}>
-                            <item.icon className={`w-4 h-4 ${item.color}`} />
+                            {i % 2 === 0 ? <Play className="w-4 h-4 text-green-400" /> : <Star className="w-4 h-4 text-yellow-400" />}
                           </div>
                           <div className="flex-1">
-                            <p className="text-sm text-gray-300">{item.text}</p>
-                            <p className="text-xs text-gray-500">{item.time}</p>
+                            <p className="text-sm text-gray-300">
+                              {i % 2 === 0 ? `New content: "${movie.title}" added` : `"${movie.title}" reached ${movie.views || 0} views`}
+                            </p>
+                            <p className="text-xs text-gray-500">{new Date(movie.createdAt).toLocaleDateString()}</p>
                           </div>
                         </div>
                       ))}
@@ -645,7 +755,7 @@ export default function AdminDashboard({
                 </motion.div>
               )}
 
-              {/* Add Content Form */}
+              {/* Add Content Form - Same as before */}
               {adminTab === 'add-movie' && (
                 <motion.div
                   key="add-movie"
@@ -656,8 +766,10 @@ export default function AdminDashboard({
                 >
                   <div className="flex items-center justify-between">
                     <div>
-                      <h2 className="text-2xl font-black">Add New Content</h2>
-                      <p className="text-sm text-gray-400 mt-1">Publish movies or TV series to your platform</p>
+                      <h2 className="text-2xl font-black">{isEditing ? 'Edit Content' : 'Add New Content'}</h2>
+                      <p className="text-sm text-gray-400 mt-1">
+                        {isEditing ? 'Update existing content' : 'Publish movies or TV series to your platform'}
+                      </p>
                     </div>
                     <button
                       onClick={() => setShowCloudinaryConfig(!showCloudinaryConfig)}
@@ -680,7 +792,7 @@ export default function AdminDashboard({
                           <label className="block text-xs font-bold text-gray-400 uppercase mb-2">Cloud Name</label>
                           <input
                             value={cloudinaryCloudName}
-                            onChange={(e) => saveCloudinaryConfig(e.target.value, cloudinaryUploadPreset)}
+                            onChange={(e) => setCloudinaryCloudName(e.target.value)}
                             className="w-full bg-gray-800 border border-gray-700 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:border-amber-500"
                             placeholder="your-cloud-name"
                           />
@@ -689,12 +801,18 @@ export default function AdminDashboard({
                           <label className="block text-xs font-bold text-gray-400 uppercase mb-2">Upload Preset</label>
                           <input
                             value={cloudinaryUploadPreset}
-                            onChange={(e) => saveCloudinaryConfig(cloudinaryCloudName, e.target.value)}
+                            onChange={(e) => setCloudinaryUploadPreset(e.target.value)}
                             className="w-full bg-gray-800 border border-gray-700 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:border-amber-500"
                             placeholder="unsigned-preset"
                           />
                         </div>
                       </div>
+                      <button
+                        onClick={() => saveCloudinaryConfig(cloudinaryCloudName, cloudinaryUploadPreset)}
+                        className="px-4 py-2 bg-amber-500 text-black font-bold rounded-xl hover:bg-amber-400 transition-all"
+                      >
+                        Save Configuration
+                      </button>
                     </motion.div>
                   )}
 
@@ -838,7 +956,7 @@ export default function AdminDashboard({
                           />
                           {isUploadingThumbnail ? (
                             <div className="space-y-3">
-                              <Upload className="w-8 h-8 text-amber-400 animate-bounce mx-auto" />
+                              <Loader2 className="w-8 h-8 text-amber-400 animate-spin mx-auto" />
                               <p className="text-sm font-bold text-amber-400">Uploading...</p>
                               <div className="w-48 h-2 bg-gray-800 rounded-full mx-auto overflow-hidden">
                                 <div
@@ -908,7 +1026,7 @@ export default function AdminDashboard({
                             />
                             {isUploadingVideo ? (
                               <div className="space-y-3">
-                                <Upload className="w-8 h-8 text-blue-400 animate-bounce mx-auto" />
+                                <Loader2 className="w-8 h-8 text-blue-400 animate-spin mx-auto" />
                                 <p className="text-sm font-bold text-blue-400">Uploading video...</p>
                                 <div className="w-48 h-2 bg-gray-800 rounded-full mx-auto overflow-hidden">
                                   <div
@@ -983,9 +1101,24 @@ export default function AdminDashboard({
                               onChange={handleBulkEpisodesUpload}
                               className="hidden"
                             />
-                            <Upload className="w-8 h-8 text-gray-500 mx-auto mb-2" />
-                            <p className="text-sm text-gray-400">Select multiple episode files</p>
-                            <p className="text-xs text-gray-600 mt-1">Videos will be uploaded sequentially</p>
+                            {isUploadingEpisodes ? (
+                              <div className="space-y-3">
+                                <Loader2 className="w-8 h-8 text-amber-400 animate-spin mx-auto" />
+                                <p className="text-sm font-bold text-amber-400">Uploading episodes...</p>
+                                <div className="w-48 h-2 bg-gray-800 rounded-full mx-auto overflow-hidden">
+                                  <div
+                                    className="h-full bg-gradient-to-r from-amber-400 to-orange-400 transition-all duration-300"
+                                    style={{ width: `${episodesUploadProgress}%` }}
+                                  />
+                                </div>
+                              </div>
+                            ) : (
+                              <div className="space-y-2">
+                                <Upload className="w-8 h-8 text-gray-500 mx-auto mb-2" />
+                                <p className="text-sm text-gray-400">Select multiple episode files</p>
+                                <p className="text-xs text-gray-600 mt-1">Videos will be uploaded sequentially</p>
+                              </div>
+                            )}
                           </div>
                         ) : (
                           <div className="space-y-3">
@@ -1037,13 +1170,32 @@ export default function AdminDashboard({
                     )}
 
                     {/* Submit Button */}
-                    <button
-                      type="submit"
-                      className="w-full py-4 bg-gradient-to-r from-amber-500 to-orange-600 text-black font-black rounded-2xl hover:shadow-lg hover:shadow-amber-500/20 transition-all flex items-center justify-center gap-2"
-                    >
-                      <Sparkles className="w-5 h-5" />
-                      Publish {contentType === 'movie' ? 'Movie' : 'TV Series'}
-                    </button>
+                    {isEditing ? (
+                      <div className="flex gap-3">
+                        <button
+                          type="submit"
+                          className="flex-1 py-4 bg-gradient-to-r from-amber-500 to-orange-600 text-black font-black rounded-2xl hover:shadow-lg hover:shadow-amber-500/20 transition-all flex items-center justify-center gap-2"
+                        >
+                          <Sparkles className="w-5 h-5" />
+                          Save Changes
+                        </button>
+                        <button
+                          type="button"
+                          onClick={cancelEdit}
+                          className="flex-1 py-4 bg-gray-800/60 text-gray-300 font-bold rounded-2xl hover:bg-gray-800 transition-all"
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    ) : (
+                      <button
+                        type="submit"
+                        className="w-full py-4 bg-gradient-to-r from-amber-500 to-orange-600 text-black font-black rounded-2xl hover:shadow-lg hover:shadow-amber-500/20 transition-all flex items-center justify-center gap-2"
+                      >
+                        <Sparkles className="w-5 h-5" />
+                        Publish {contentType === 'movie' ? 'Movie' : 'TV Series'}
+                      </button>
+                    )}
                   </form>
                 </motion.div>
               )}
@@ -1127,7 +1279,13 @@ export default function AdminDashboard({
                               <div className="absolute inset-0 bg-gradient-to-t from-gray-900 via-transparent to-transparent" />
                               <div className="absolute top-2 right-2 flex gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
                                 <button
-                                  onClick={() => onDeleteMovie(movie.id)}
+                                  onClick={() => startEdit(movie)}
+                                  className="p-2 bg-white/5 hover:bg-white/10 text-amber-400 rounded-xl transition-all"
+                                >
+                                  <Edit3 className="w-4 h-4" />
+                                </button>
+                                <button
+                                  onClick={() => handleDeleteMovie(movie.id)}
                                   className="p-2 bg-red-500/20 hover:bg-red-500/30 text-red-400 rounded-xl transition-all"
                                 >
                                   <Trash2 className="w-4 h-4" />
@@ -1192,7 +1350,13 @@ export default function AdminDashboard({
                                 <td className="p-4 text-sm text-gray-400">{movie.views?.toLocaleString()}</td>
                                 <td className="p-4 text-right">
                                   <button
-                                    onClick={() => onDeleteMovie(movie.id)}
+                                    onClick={() => startEdit(movie)}
+                                    className="p-2 hover:bg-white/5 rounded-xl text-amber-400 transition-all mr-2"
+                                  >
+                                    <Edit3 className="w-4 h-4" />
+                                  </button>
+                                  <button
+                                    onClick={() => handleDeleteMovie(movie.id)}
                                     className="p-2 hover:bg-red-500/10 rounded-xl text-red-400 transition-all"
                                   >
                                     <Trash2 className="w-4 h-4" />
@@ -1238,7 +1402,7 @@ export default function AdminDashboard({
                       { label: 'Total Users', value: stats.totalUsers, icon: Users, color: 'text-blue-400' },
                       { label: 'VIP Members', value: stats.subscribedUsers, icon: Crown, color: 'text-amber-400' },
                       { label: 'Free Users', value: stats.freeUsers, icon: UserX, color: 'text-gray-400' },
-                      { label: 'Conversion Rate', value: `${((stats.subscribedUsers / stats.totalUsers) * 100).toFixed(1)}%`, icon: TrendingUp, color: 'text-green-400' },
+                      { label: 'Conversion Rate', value: `${((stats.subscribedUsers / (stats.totalUsers || 1)) * 100).toFixed(1)}%`, icon: TrendingUp, color: 'text-green-400' },
                     ].map((stat) => (
                       <div key={stat.label} className="bg-gray-900/50 border border-gray-800/50 rounded-2xl p-4">
                         <div className="flex items-center justify-between mb-2">
@@ -1295,8 +1459,7 @@ export default function AdminDashboard({
                             <td className="p-4 text-right">
                               <button
                                 onClick={() => {
-                                  onUpdateUserSubscription(user.id, !user.subscription?.active, 'gold');
-                                  addToast(`Updated ${user.username}'s subscription`, 'success');
+                                  handleUpdateUserSubscription(user.id, !user.subscription?.active, 'gold');
                                 }}
                                 className={`px-4 py-2 rounded-xl text-xs font-bold transition-all ${
                                   user.subscription?.active
@@ -1337,7 +1500,7 @@ export default function AdminDashboard({
                           <label className="block text-xs font-bold text-gray-400 uppercase mb-2">Cloud Name</label>
                           <input
                             value={cloudinaryCloudName}
-                            onChange={(e) => saveCloudinaryConfig(e.target.value, cloudinaryUploadPreset)}
+                            onChange={(e) => setCloudinaryCloudName(e.target.value)}
                             className="w-full bg-gray-800/50 border border-gray-700/50 rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-amber-500"
                           />
                         </div>
@@ -1345,11 +1508,17 @@ export default function AdminDashboard({
                           <label className="block text-xs font-bold text-gray-400 uppercase mb-2">Upload Preset</label>
                           <input
                             value={cloudinaryUploadPreset}
-                            onChange={(e) => saveCloudinaryConfig(cloudinaryCloudName, e.target.value)}
+                            onChange={(e) => setCloudinaryUploadPreset(e.target.value)}
                             className="w-full bg-gray-800/50 border border-gray-700/50 rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-amber-500"
                           />
                         </div>
                       </div>
+                      <button
+                        onClick={() => saveCloudinaryConfig(cloudinaryCloudName, cloudinaryUploadPreset)}
+                        className="mt-4 px-4 py-2 bg-amber-500 text-black font-bold rounded-xl hover:bg-amber-400 transition-all"
+                      >
+                        Save Configuration
+                      </button>
                     </div>
 
                     <div className="border-t border-gray-800 pt-6">
@@ -1359,7 +1528,7 @@ export default function AdminDashboard({
                       </h3>
                       <div className="grid grid-cols-3 gap-4">
                         <div className="bg-gray-800/50 rounded-xl p-4 text-center">
-                          <p className="text-2xl font-black">{stats.totalMovies + stats.totalSeries}</p>
+                          <p className="text-2xl font-black">{movies.length}</p>
                           <p className="text-xs text-gray-400 mt-1">Total Assets</p>
                         </div>
                         <div className="bg-gray-800/50 rounded-xl p-4 text-center">
@@ -1370,6 +1539,23 @@ export default function AdminDashboard({
                           <p className="text-2xl font-black text-green-400">Unlimited</p>
                           <p className="text-xs text-gray-400 mt-1">Bandwidth</p>
                         </div>
+                      </div>
+                    </div>
+
+                    <div className="border-t border-gray-800 pt-6">
+                      <h3 className="text-sm font-bold mb-4 flex items-center gap-2">
+                        <Database className="w-4 h-4 text-purple-400" />
+                        Data Management
+                      </h3>
+                      <div className="flex gap-3">
+                        <button
+                          onClick={fetchData}
+                          disabled={isLoading}
+                          className="px-4 py-2 bg-blue-500/10 text-blue-400 border border-blue-500/20 rounded-xl hover:bg-blue-500/20 transition-all disabled:opacity-50 flex items-center gap-2"
+                        >
+                          <RefreshCw className={`w-4 h-4 ${isLoading ? 'animate-spin' : ''}`} />
+                          Sync Data
+                        </button>
                       </div>
                     </div>
                   </div>

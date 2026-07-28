@@ -73,3 +73,26 @@ export interface PlatformStats {
   monthlyRevenue: number[];
   genreViews: { genre: string; count: number }[];
 }
+
+
+export interface User {
+  id: string;
+  email: string;
+  username: string;
+  role: 'admin' | 'user';
+  subscription: {
+    active: boolean;
+    planId?: string;
+    expiresAt?: string;
+    autoRenew?: boolean;
+  };
+  watchlist: string[];
+  history: Array<{
+    movieId: string;
+    watchedAt: string;
+    progress: number;
+    currentTime?: number;
+  }>;
+  createdAt: string;
+  updatedAt?: string;
+}
